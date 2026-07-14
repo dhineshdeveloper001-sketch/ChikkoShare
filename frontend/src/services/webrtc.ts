@@ -300,16 +300,17 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
 
       // Check buffer
       const buffered = dc.bufferedAmount || 0;
-      let currentChunkSize = 256 * 1024;
       
-      if (buffered > 10 * 1024 * 1024) {
-         // High congestion, back off
-         setTimeout(sendNextChunk, 100);
+      // SCTP max message size is technically ~256KB in modern browsers, but 64KB is the universally 
+      // guaranteed safe size across all WebRTC implementations to prevent 'max-message-size' errors.
+      let currentChunkSize = 64 * 1024; 
+      
+
+      
+      if (buffered > 8 * 1024 * 1024) {
+         // High congestion, back off temporarily
+         setTimeout(sendNextChunk, 50);
          return;
-      } else if (buffered < 1 * 1024 * 1024) {
-         currentChunkSize = 1024 * 1024; // Scale up
-      } else if (buffered > 5 * 1024 * 1024) {
-         currentChunkSize = 128 * 1024; // Scale down
       }
 
       try {
