@@ -120,7 +120,6 @@ export const initiateWebRTCConnection = async (receiverSocketId: string) => {
       if (rawFiles.length > 0) {
         peer.state = 'TRANSFERRING';
         console.log(`[TRANSFER] START → ${rawFiles[0].name} to ${receiverSocketId}`);
-        const mode = useRoomStore.getState().roomData?.transferMode;
         useTransferStore.getState().setSenderStatus('transferring');
         useTransferStore.getState().setReceiverStatus(receiverSocketId, 'transferring');
         sendFileToPeer(rawFiles[0], receiverSocketId, dc);
