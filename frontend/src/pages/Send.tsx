@@ -4,7 +4,7 @@ import { motion } from 'framer-motion';
 import { FiUploadCloud, FiCheck, FiX, FiActivity, FiSettings, FiTrash2 } from 'react-icons/fi';
 import toast from 'react-hot-toast';
 import { socket, connectSocket } from '../services/socket';
-import { startTransferToAll, removePeer, clearPeers } from '../services/webrtc';
+import { removePeer, clearPeers } from '../services/webrtc';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
 import type { TransferMode } from '../../../shared/types';
@@ -51,14 +51,15 @@ const Send: React.FC = () => {
   const handleCreateRoom = () => {
     if (selectedFiles.length === 0) return toast.error('Please select at least one file to send.');
     
+    // Store File objects on window BEFORE clearing state so dc.onopen can access them
+    (window as any).__chikkoFiles = selectedFiles;
+
     clearPeers();
     useRoomStore.getState().reset();
     useTransferStore.getState().reset();
-    // Re-apply role and files since reset clears them
     useTransferStore.getState().setRole('sender');
     useTransferStore.getState().setFiles(selectedFiles.map(f => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified })));
     
-    // Generate a sender name if not existing
     let senderName = localStorage.getItem('chikko_device_name');
     if (!senderName) {
       senderName = `Sender-${Math.floor(Math.random() * 10000)}`;
@@ -90,6 +91,8 @@ const Send: React.FC = () => {
        toast.success('Files validated! Ready to resume transfer.');
     }
 
+    // Store actual File objects on window so dc.onopen can access them
+    (window as any).__chikkoFiles = newFiles;
     setSelectedFiles(newFiles);
     setFiles(newFiles.map(f => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified })));
   };
@@ -106,52 +109,8 @@ const Send: React.FC = () => {
 
 
 
-  const startTransfer = async () => {
-    console.log('[SEND] startTransfer called:', {
-      selectedFilesCount: selectedFiles.length,
-      connectedReceiversSize: connectedReceivers.size,
-      senderStatus,
-    });
-    if (connectedReceivers.size === 0) {
-      console.warn('[SEND] Aborted: no connected receivers');
-      return;
-    }
-    if (selectedFiles.length === 0) {
-      console.warn('[SEND] Aborted: no selected files (actual File objects)');
-      return;
-    }
-    const file = selectedFiles[0];
-    console.log('[SEND] Calling startTransferToAll with file:', file.name, file.size);
-    try {
-      await startTransferToAll(file);
-    } catch (err) {
-      console.error('[SEND] startTransferToAll threw:', err);
-    }
-  };
-
-  // Auto-start transfer once connections are established
-  useEffect(() => {
-    const currentReceiverStates = Array.from(connectedReceivers.keys()).map(id => ({
-      id,
-      status: receiverStates.get(id)?.status,
-    }));
-    console.log('[SEND] Auto-start check:', {
-      selectedFilesCount: selectedFiles.length,
-      connectedReceiversSize: connectedReceivers.size,
-      senderStatus,
-      receiverStatuses: currentReceiverStates,
-    });
-
-    if (selectedFiles.length > 0 && connectedReceivers.size > 0 && senderStatus === 'idle') {
-      const anyCurrentReady = Array.from(connectedReceivers.keys()).some(socketId =>
-        receiverStates.get(socketId)?.status === 'connected'
-      );
-      console.log('[SEND] anyCurrentReady:', anyCurrentReady);
-      if (anyCurrentReady) {
-        startTransfer();
-      }
-    }
-  }, [selectedFiles, connectedReceivers.size, senderStatus, receiverStates, connectedReceivers]);
+  // Transfer is now triggered automatically from dc.onopen inside webrtc.ts.
+  // No useEffect needed here — this eliminates the React closure race condition.
 
   const approveRequest = (socketId: string) => {
     if (!roomData) return;

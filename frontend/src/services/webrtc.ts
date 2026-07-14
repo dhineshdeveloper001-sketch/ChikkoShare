@@ -9,30 +9,65 @@ const STUN_SERVERS = [
   { urls: 'stun:stun2.l.google.com:19302' },
 ];
 
+// ─── State Machine ────────────────────────────────────────────────────────────
+export type PeerState =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'PEER_CONNECTED'
+  | 'DATACHANNEL_OPEN'
+  | 'READY_FOR_TRANSFER'
+  | 'TRANSFERRING'
+  | 'COMPLETED'
+  | 'FAILED';
+
 interface PeerInstance {
   pc: RTCPeerConnection;
   dc: RTCDataChannel | null;
-  status: 'connecting' | 'connected' | 'disconnected';
+  state: PeerState;
 }
 
-// Maps receiver socketId to their Peer Connection & Data Channel
+// Maps receiverSocketId → PeerInstance (Sender side)
 const peers = new Map<string, PeerInstance>();
 
-// Current Receiver Connection (for Receiver role)
+// Receiver side
 let myPeerConnection: RTCPeerConnection | null = null;
 let myDataChannel: RTCDataChannel | null = null;
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 export const clearPeers = () => {
-  peers.forEach(p => p.pc.close());
+  peers.forEach(p => { try { p.dc?.close(); p.pc.close(); } catch (_) {} });
   peers.clear();
 };
 
-// For Sender Role: Initiate connection to a specific receiver
+export const removePeer = (socketId: string) => {
+  const peer = peers.get(socketId);
+  if (peer) {
+    try { peer.dc?.close(); peer.pc.close(); } catch (_) {}
+    peers.delete(socketId);
+  }
+};
+
+export const closeWebRTC = () => {
+  clearPeers();
+  try { myDataChannel?.close(); myPeerConnection?.close(); } catch (_) {}
+  myPeerConnection = null;
+  myDataChannel = null;
+};
+
+const getBrowserMaxChunk = (socketId: string): number => {
+  const receiver = useRoomStore.getState().connectedReceivers.get(socketId);
+  const browser = (receiver?.browser || '').toLowerCase();
+  if (browser.includes('safari')) return 64 * 1024;
+  if (browser.includes('firefox')) return 128 * 1024;
+  return 256 * 1024; // Chrome / Edge / default
+};
+
+// ─── SENDER: Initiate WebRTC ──────────────────────────────────────────────────
 export const initiateWebRTCConnection = async (receiverSocketId: string) => {
+  console.log(`[SOCKET] RECEIVER JOINED → initiating WebRTC for ${receiverSocketId}`);
   try {
     const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
-    
-    peers.set(receiverSocketId, { pc, dc: null, status: 'connecting' });
+    peers.set(receiverSocketId, { pc, dc: null, state: 'CONNECTING' });
     useTransferStore.getState().initReceiverState(receiverSocketId);
 
     pc.onicecandidate = (event) => {
@@ -50,66 +85,71 @@ export const initiateWebRTCConnection = async (receiverSocketId: string) => {
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`WebRTC State [${receiverSocketId}]:`, pc.connectionState);
+      const state = pc.connectionState;
+      console.log(`[WEBRTC] ICE STATE [${receiverSocketId}]: ${state}`);
       const peer = peers.get(receiverSocketId);
       if (!peer) return;
 
-      if (pc.connectionState === 'connected') {
-        peer.status = 'connected';
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        peer.status = 'disconnected';
-        if (pc.signalingState !== 'closed') {
-           console.log(`Attempting ICE restart for ${receiverSocketId}`);
-           pc.createOffer({ iceRestart: true }).then(offer => {
-             return pc.setLocalDescription(offer);
-           }).then(() => {
-             const roomId = useRoomStore.getState().roomData?.roomId;
-             if (roomId) {
-               socket.emit('signaling_message', { roomId, targetSocketId: receiverSocketId, type: 'offer', payload: pc.localDescription });
-             }
-           }).catch(() => {
-             useTransferStore.getState().setReceiverStatus(receiverSocketId, 'failed');
-             toast.error('Connection lost with a receiver.');
-           });
-        }
+      if (state === 'connected') {
+        peer.state = 'PEER_CONNECTED';
+        console.log(`[WEBRTC] ICE CONNECTED for ${receiverSocketId}`);
+      } else if (state === 'disconnected' || state === 'failed') {
+        peer.state = 'FAILED';
+        useTransferStore.getState().setReceiverStatus(receiverSocketId, 'failed');
+        toast.error('Connection lost with receiver.');
       }
     };
 
     const dc = pc.createDataChannel('fileTransfer', { ordered: true });
     peers.get(receiverSocketId)!.dc = dc;
-    
     dc.binaryType = 'arraybuffer';
+
     dc.onopen = () => {
       console.log(`[WEBRTC] DATACHANNEL OPEN for ${receiverSocketId}`);
+      const peer = peers.get(receiverSocketId);
+      if (!peer) return;
+      peer.state = 'DATACHANNEL_OPEN';
       useTransferStore.getState().setReceiverStatus(receiverSocketId, 'connected');
-    };
-    dc.onclose = () => {
-      console.log(`Data channel closed for ${receiverSocketId}`);
+      console.log(`[TRANSFER] READY for ${receiverSocketId}`);
+
+      // ── AUTO-START: Trigger transfer from inside the DataChannel open event ──
+      // This is the ONLY place transfer is triggered — no React useEffect needed.
+      const { files: fileMetas } = useTransferStore.getState();
+      const rawFiles: File[] = (window as any).__chikkoFiles || [];
+
+      if (rawFiles.length > 0) {
+        peer.state = 'TRANSFERRING';
+        console.log(`[TRANSFER] START → ${rawFiles[0].name} to ${receiverSocketId}`);
+        const mode = useRoomStore.getState().roomData?.transferMode;
+        useTransferStore.getState().setSenderStatus('transferring');
+        useTransferStore.getState().setReceiverStatus(receiverSocketId, 'transferring');
+        sendFileToPeer(rawFiles[0], receiverSocketId, dc);
+      } else {
+        console.warn(`[TRANSFER] DC open but no File objects available. Files:`, fileMetas.length);
+      }
     };
 
+    dc.onclose = () => console.log(`[WEBRTC] DATACHANNEL CLOSED for ${receiverSocketId}`);
+    dc.onerror = (e) => console.error(`[WEBRTC] DATACHANNEL ERROR for ${receiverSocketId}`, e);
+
+    console.log(`[WEBRTC] OFFER CREATED for ${receiverSocketId}`);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
     const roomId = useRoomStore.getState().roomData?.roomId;
     if (roomId) {
-      socket.emit('signaling_message', {
-        roomId,
-        targetSocketId: receiverSocketId,
-        type: 'offer',
-        payload: offer,
-      });
+      socket.emit('signaling_message', { roomId, targetSocketId: receiverSocketId, type: 'offer', payload: offer });
     }
-
   } catch (err) {
-    console.error('Error initiating WebRTC:', err);
+    console.error('[WEBRTC] Error initiating connection:', err);
     toast.error('Failed to establish P2P connection.');
   }
 };
 
-// For Receiver Role: Wait for connection
+// ─── RECEIVER: Setup WebRTC ───────────────────────────────────────────────────
 export const setupReceiverWebRTC = async (senderSocketId: string) => {
   myPeerConnection = new RTCPeerConnection({ iceServers: STUN_SERVERS });
-  
+
   myPeerConnection.onicecandidate = (event) => {
     if (event.candidate) {
       const roomId = useRoomStore.getState().roomData?.roomId;
@@ -125,9 +165,11 @@ export const setupReceiverWebRTC = async (senderSocketId: string) => {
   };
 
   myPeerConnection.onconnectionstatechange = () => {
-    if (myPeerConnection?.connectionState === 'connected') {
+    const state = myPeerConnection?.connectionState;
+    console.log(`[WEBRTC] RECEIVER ICE STATE: ${state}`);
+    if (state === 'connected') {
       useTransferStore.getState().setMyStatus('connected');
-    } else if (myPeerConnection?.connectionState === 'disconnected' || myPeerConnection?.connectionState === 'failed') {
+    } else if (state === 'disconnected' || state === 'failed') {
       useTransferStore.getState().setMyStatus('failed');
       toast.error('Connection lost with sender.');
     }
@@ -136,64 +178,51 @@ export const setupReceiverWebRTC = async (senderSocketId: string) => {
   myPeerConnection.ondatachannel = (event) => {
     myDataChannel = event.channel;
     myDataChannel.binaryType = 'arraybuffer';
-    
     myDataChannel.onopen = () => {
       console.log('[WEBRTC] DATACHANNEL OPEN (Receiver)');
       useTransferStore.getState().setMyStatus('connected');
     };
-    
     myDataChannel.onmessage = handleIncomingData;
+    myDataChannel.onerror = (e) => console.error('[WEBRTC] RECEIVER DATACHANNEL ERROR', e);
   };
 };
 
+// ─── Signaling Router ─────────────────────────────────────────────────────────
 export const handleSignalingMessage = async (msg: any) => {
   const isSender = useTransferStore.getState().role === 'sender';
-  
   try {
     if (isSender) {
-      // Handle receiver's answer or ice candidates
-      const senderSocketId = msg.senderSocketId; // actually the receiver who sent it
-      const peer = peers.get(senderSocketId);
+      const peer = peers.get(msg.senderSocketId);
       if (!peer) return;
-
       if (msg.type === 'answer') {
+        console.log(`[WEBRTC] ANSWER RECEIVED from ${msg.senderSocketId}`);
         await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
       } else if (msg.type === 'ice-candidate') {
         await peer.pc.addIceCandidate(new RTCIceCandidate(msg.payload));
       }
     } else {
-      // Handle sender's offer or ice candidates
-      if (!myPeerConnection) {
-        await setupReceiverWebRTC(msg.senderSocketId);
-      }
-
+      if (!myPeerConnection) await setupReceiverWebRTC(msg.senderSocketId);
       if (msg.type === 'offer') {
         await myPeerConnection?.setRemoteDescription(new RTCSessionDescription(msg.payload));
         const answer = await myPeerConnection?.createAnswer();
         await myPeerConnection?.setLocalDescription(answer);
-
-        socket.emit('signaling_message', {
-          roomId: msg.roomId,
-          targetSocketId: msg.senderSocketId,
-          type: 'answer',
-          payload: answer,
-        });
+        socket.emit('signaling_message', { roomId: msg.roomId, targetSocketId: msg.senderSocketId, type: 'answer', payload: answer });
       } else if (msg.type === 'ice-candidate') {
         await myPeerConnection?.addIceCandidate(new RTCIceCandidate(msg.payload));
       }
     }
   } catch (err) {
-    console.error('Error handling signaling message:', err);
+    console.error('[WEBRTC] Signaling error:', err);
   }
 };
 
-// --- CHUNK TRANSFER ENGINE (Receiver Side) ---
+// ─── RECEIVER: Incoming Data Handler ─────────────────────────────────────────
 let receiveBuffer: ArrayBuffer[] = [];
 let receivedSize = 0;
 let fileMeta: any = null;
-let startTime = 0;
-let lastReceiverUiUpdate = 0;
-let receiverBytesAccumulated = 0;
+let rxStartTime = 0;
+let lastRxUiUpdate = 0;
+let rxBytesAccum = 0;
 let receiverHashWorker: Worker | null = null;
 
 const handleIncomingData = (event: MessageEvent) => {
@@ -206,36 +235,32 @@ const handleIncomingData = (event: MessageEvent) => {
           receiverHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
           receiverHashWorker.postMessage({ type: 'init' });
         }
-        
         if (fileMeta && fileMeta.name === data.name && fileMeta.size === data.size && receivedSize > 0) {
-          console.log(`Resuming file transfer from offset ${receivedSize}`);
+          console.log(`[WEBRTC] RESUMING from offset ${receivedSize}`);
         } else {
-          // New file or restart, reset everything
           receiverHashWorker.postMessage({ type: 'init' });
           fileMeta = data;
           receiveBuffer = [];
           receivedSize = 0;
-          receiverBytesAccumulated = 0;
-          startTime = performance.now();
-          lastReceiverUiUpdate = startTime;
+          rxBytesAccum = 0;
+          rxStartTime = performance.now();
+          lastRxUiUpdate = rxStartTime;
           useTransferStore.getState().setMyStatus('transferring');
           useTransferStore.getState().setFiles([{ name: fileMeta.name, size: fileMeta.size, type: fileMeta.fileType }]);
         }
-        console.log(`[WEBRTC] SENDING SYNC_OFFSET: ${receivedSize}`);
+        console.log(`[WEBRTC] SYNC_OFFSET SEND: ${receivedSize}`);
         myDataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: receivedSize }));
       } else if (data.type === 'eof') {
-        const elapsedSec = (performance.now() - startTime) / 1000;
+        const elapsedSec = (performance.now() - rxStartTime) / 1000;
         const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
-        useTransferStore.getState().updateMyState(receiverBytesAccumulated, speed);
-        receiverBytesAccumulated = 0;
-        
+        useTransferStore.getState().updateMyState(rxBytesAccum, speed);
+        rxBytesAccum = 0;
         if (receiverHashWorker) {
           receiverHashWorker.onmessage = (e) => {
             if (e.data.type === 'result') {
-              const computedHash = e.data.hash;
-              if (computedHash !== data.hash || data.fileSize !== receivedSize) {
-                useTransferStore.getState().setMyStatus('failed'); // Set a generic failed or 'corrupted' status
-                toast.error('File corrupted during transfer! Hashes do not match.', { duration: 8000 });
+              if (e.data.hash !== data.hash || data.fileSize !== receivedSize) {
+                useTransferStore.getState().setMyStatus('failed');
+                toast.error('File corrupted! Hash mismatch.', { duration: 8000 });
               } else {
                 finishReceivingFile();
               }
@@ -253,324 +278,257 @@ const handleIncomingData = (event: MessageEvent) => {
     }
   } else {
     const chunk = event.data as ArrayBuffer;
-    if (receivedSize === 0) console.log(`[WEBRTC] RECEIVE CHUNK 0`);
+    if (receivedSize === 0) console.log(`[CHUNK] RECEIVE 0`);
     receiveBuffer.push(chunk);
     receiverHashWorker?.postMessage({ type: 'update', chunk });
     receivedSize += chunk.byteLength;
-    receiverBytesAccumulated += chunk.byteLength;
-    
+    rxBytesAccum += chunk.byteLength;
     const now = performance.now();
-    if (now - lastReceiverUiUpdate > 250) {
-      const elapsedSec = (now - startTime) / 1000;
-      const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
-      useTransferStore.getState().updateMyState(receiverBytesAccumulated, speed);
-      receiverBytesAccumulated = 0;
-      lastReceiverUiUpdate = now;
+    if (now - lastRxUiUpdate > 250) {
+      const speed = (performance.now() - rxStartTime) > 0 ? receivedSize / ((performance.now() - rxStartTime) / 1000) : 0;
+      useTransferStore.getState().updateMyState(rxBytesAccum, speed);
+      rxBytesAccum = 0;
+      lastRxUiUpdate = now;
     }
   }
 };
 
 const finishReceivingFile = async () => {
   useTransferStore.getState().setMyStatus('completed');
-  
-  const blob = new Blob(receiveBuffer, { type: fileMeta.type || 'application/octet-stream' });
+  const blob = new Blob(receiveBuffer, { type: fileMeta.fileType || 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
-  
   const a = document.createElement('a');
   a.href = url;
   a.download = fileMeta.name;
   a.click();
-  
   URL.revokeObjectURL(url);
-  toast.success(`Received ${fileMeta.name}`);
-  
+  toast.success(`Downloaded: ${fileMeta.name}`);
   useTransferStore.getState().addHistoryRecord({
     fileName: fileMeta.name,
     size: fileMeta.size,
     mode: 'receive',
-    deviceName: 'Sender', // Usually we don't have the exact sender name easily here without roomStore cross-referencing, but this is fine.
+    deviceName: 'Sender',
     date: Date.now(),
     status: 'Completed',
-    duration: (performance.now() - startTime) / 1000
+    duration: (performance.now() - rxStartTime) / 1000,
   });
-  
   receiveBuffer = [];
 };
 
-// --- CHUNK SCHEDULER (Sender Side) ---
+// ─── SENDER: File Pump ────────────────────────────────────────────────────────
 export const startTransferToAll = async (file: File) => {
   const mode = useRoomStore.getState().roomData?.transferMode;
-
-  // Prepare receivers — check OPEN DataChannels
   const activePeers = Array.from(peers.entries()).filter(([_, p]) => p.dc?.readyState === 'open');
-  console.log(`[WEBRTC] START CHECK: file=${file.name}, activePeers=${activePeers.length}, peersTotal=${peers.size}`);
+  console.log(`[TRANSFER] startTransferToAll: file=${file.name}, activePeers=${activePeers.length}, peersTotal=${peers.size}`);
+  peers.forEach((p, id) => console.log(`  peer ${id}: dcState=${p.dc?.readyState ?? 'null'}, peerState=${p.state}`));
+
   if (activePeers.length === 0) {
-    console.error('[WEBRTC] No open DataChannels found. Aborting.');
-    // Log each peer's dc state for debugging
-    peers.forEach((p, id) => console.warn(`  peer ${id}: dc.readyState=${p.dc?.readyState ?? 'null'}`));
+    console.error('[TRANSFER] No open DataChannels. Cannot start.');
     useTransferStore.getState().setSenderStatus('failed');
-    toast.error('Connection not ready. Please wait and try again.');
+    toast.error('Connection not ready. Please wait.');
     return;
   }
 
   useTransferStore.getState().setSenderStatus('transferring');
-  console.log(`[WEBRTC] TRANSFER START: ${file.name} → ${activePeers.length} peer(s), mode=${mode}`);
+  console.log(`[TRANSFER] START → ${file.name} to ${activePeers.length} peer(s), mode=${mode}`);
 
   if (mode === 'queue') {
-    // Sequential — sendFileToPeer sends its own metadata after registering listener
     for (const [socketId, peer] of activePeers) {
       useTransferStore.getState().setReceiverStatus(socketId, 'transferring');
       await sendFileToPeer(file, socketId, peer.dc!);
     }
   } else {
-    // Broadcast & Private (Parallel)
-    const promises = activePeers.map(([socketId, peer]) => {
+    await Promise.all(activePeers.map(([socketId, peer]) => {
       useTransferStore.getState().setReceiverStatus(socketId, 'transferring');
       return sendFileToPeer(file, socketId, peer.dc!);
-    });
-    await Promise.all(promises);
+    }));
   }
 };
 
 const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promise<void> => {
   return new Promise((resolve) => {
-    console.log(`[WEBRTC] sendFileToPeer: registering sync_offset listener for ${socketId}`);
+    console.log(`[WEBRTC] sendFileToPeer: attaching sync_offset listener for ${socketId}`);
 
-    // Handshake Timeout & Retry
     let retryTimeout: ReturnType<typeof setTimeout>;
     let abortTimeout: ReturnType<typeof setTimeout>;
 
-    // STEP 1: Register the sync_offset listener FIRST
+    // Step 1: Attach listener FIRST
     const onMessage = (event: MessageEvent) => {
-      if (typeof event.data === 'string') {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'sync_offset') {
-            console.log(`[WEBRTC] SYNC_OFFSET RECEIVED from ${socketId}: offset=${data.offset}`);
-            clearTimeout(retryTimeout);
-            clearTimeout(abortTimeout);
-            dc.removeEventListener('message', onMessage);
-            startPumping(data.offset || 0);
-          }
-        } catch (e) {
-          console.error('[WEBRTC] Error processing handshake message:', e);
+      if (typeof event.data !== 'string') return;
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'sync_offset') {
+          console.log(`[WEBRTC] SYNC_OFFSET RECEIVED from ${socketId}: offset=${data.offset}`);
+          clearTimeout(retryTimeout);
+          clearTimeout(abortTimeout);
+          dc.removeEventListener('message', onMessage);
+          startPumping(data.offset || 0);
         }
+      } catch (e) {
+        console.error('[WEBRTC] Handshake parse error:', e);
       }
     };
     dc.addEventListener('message', onMessage);
 
-    // STEP 2: Send metadata AFTER listener is attached
+    // Step 2: Send metadata AFTER listener is attached
     const sendMetadata = () => {
       const meta = JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type });
-      console.log(`[WEBRTC] METADATA SEND to ${socketId}: ${file.name} (${file.size} bytes)`);
+      console.log(`[WEBRTC] METADATA SEND → ${socketId}: ${file.name} (${file.size} bytes)`);
       dc.send(meta);
     };
+    sendMetadata();
 
-    sendMetadata(); // Send immediately after listener is registered
-
-    // Retry if no sync_offset within 8 seconds
+    // Retry after 8s if no sync_offset received
     retryTimeout = setTimeout(() => {
-      console.warn(`[WEBRTC] sync_offset timeout (8s). Retrying metadata to ${socketId}`);
+      console.warn(`[WEBRTC] sync_offset timeout (8s) for ${socketId} — retrying metadata`);
       sendMetadata();
-
       abortTimeout = setTimeout(() => {
-        console.error(`[WEBRTC] Handshake permanently failed for ${socketId} after retry`);
+        console.error(`[WEBRTC] Handshake permanently failed for ${socketId}`);
         dc.removeEventListener('message', onMessage);
         useTransferStore.getState().setReceiverStatus(socketId, 'failed');
-        toast.error('Receiver initialization failed. Please reconnect.');
+        toast.error('Receiver init failed. Please reconnect.');
         resolve();
       }, 8000);
     }, 8000);
 
     const startPumping = (initialOffset: number) => {
+      console.log(`[CHUNK] PUMP START for ${socketId} from offset ${initialOffset}`);
       const senderHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
       senderHashWorker.postMessage({ type: 'init' });
-      
+
       let offset = initialOffset;
-      const startTime = performance.now();
+      const txStartTime = performance.now();
       let retryCount = 0;
-      
       let lastUiUpdate = performance.now();
-      let bytesAddedSinceLastUpdate = 0;
-      
-      dc.bufferedAmountLowThreshold = 1024 * 1024; // 1 MB
+      let bytesAccum = 0;
+
+      const HIGH_WATER = 2 * 1024 * 1024; // 2 MB
+      dc.bufferedAmountLowThreshold = 512 * 1024; // 512 KB
       let isPaused = false;
-      let sending = false;
-      
-      const readSlice = (o: number, size: number): Promise<ArrayBuffer> => {
-        return new Promise<ArrayBuffer>((res, rej) => {
+      let pumping = false;
+
+      const maxChunk = getBrowserMaxChunk(socketId);
+      let currentChunkSize = Math.min(256 * 1024, maxChunk);
+
+      const readSlice = (o: number, size: number): Promise<ArrayBuffer> =>
+        new Promise((res, rej) => {
           const reader = new FileReader();
           reader.onload = (e) => res(e.target?.result as ArrayBuffer);
           reader.onerror = rej;
           reader.readAsArrayBuffer(file.slice(o, o + size));
         });
-      };
-
-      const getAdaptiveChunkSize = (speed: number) => {
-        let desired = 128 * 1024;
-        if (speed < 1 * 1024 * 1024) desired = 128 * 1024;
-        else if (speed < 5 * 1024 * 1024) desired = 256 * 1024;
-        else desired = 512 * 1024;
-        
-        // Clamp based on receiver browser
-        const receiver = useRoomStore.getState().connectedReceivers.get(socketId);
-        const browser = (receiver?.browser || '').toLowerCase();
-        
-        let maxSafeSize = 128 * 1024; // Default safe limit
-        if (browser.includes('safari')) maxSafeSize = 64 * 1024;
-        else if (browser.includes('firefox')) maxSafeSize = 128 * 1024;
-        else if (browser.includes('chrome') || browser.includes('edge')) maxSafeSize = 256 * 1024;
-        
-        return Math.min(desired, maxSafeSize);
-      };
 
       let nextChunkPromise: Promise<ArrayBuffer> | null = null;
-      let currentChunkSize = 128 * 1024;
-      
-      const prefetchNextChunk = (o: number, size: number) => {
+      const prefetch = (o: number) => {
         if (o < file.size) {
-          nextChunkPromise = readSlice(o, Math.min(size, file.size - o));
+          const sz = Math.min(currentChunkSize, file.size - o);
+          nextChunkPromise = readSlice(o, sz);
         } else {
           nextChunkPromise = null;
         }
       };
+      prefetch(offset);
 
-      // Initial prefetch
-      prefetchNextChunk(offset, currentChunkSize);
-
-      let firstChunkLogged = false;
+      let firstChunk = true;
 
       const pump = async () => {
-        if (sending) return;
-        sending = true;
+        if (pumping) return;
+        pumping = true;
 
         while (offset < file.size) {
-          if (dc.readyState !== 'open') {
-             resolve();
-             return;
-          }
+          if (dc.readyState !== 'open') { resolve(); return; }
 
-        if (dc.bufferedAmount > dc.bufferedAmountLowThreshold) {
-          isPaused = true;
-          sending = false;
-          return; // Wait for onbufferedamountlow
-        }
-
-        try {
-          if (!nextChunkPromise) prefetchNextChunk(offset, currentChunkSize);
-          const chunk = await nextChunkPromise!;
-          
-          if (!firstChunkLogged) {
-             console.log(`[WEBRTC] SEND CHUNK 0`);
-             firstChunkLogged = true;
-          }
-          
-          dc.send(chunk);
-          senderHashWorker.postMessage({ type: 'update', chunk });
-          offset += chunk.byteLength;
-          retryCount = 0;
-          bytesAddedSinceLastUpdate += chunk.byteLength;
-
-          const now = performance.now();
-          const elapsedSec = (now - startTime) / 1000;
-          const speed = elapsedSec > 0 ? offset / elapsedSec : 0;
-          
-          currentChunkSize = getAdaptiveChunkSize(speed);
-          prefetchNextChunk(offset, currentChunkSize); // Pipeline the next read
-
-          if (now - lastUiUpdate > 250 || offset >= file.size) {
-            useTransferStore.getState().updateReceiverState(socketId, bytesAddedSinceLastUpdate, speed);
-            bytesAddedSinceLastUpdate = 0;
-            lastUiUpdate = now;
-          }
-        } catch (e) {
-          console.error('Error sending chunk to', socketId, e);
-          if (retryCount < 5) {
-            retryCount++;
-            await new Promise(r => setTimeout(r, 1000));
-            nextChunkPromise = null; // force re-read
-          } else {
-            useTransferStore.getState().setReceiverStatus(socketId, 'failed');
-            const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-            useTransferStore.getState().addHistoryRecord({
-              fileName: file.name,
-              size: file.size,
-              mode: 'send',
-              deviceName: receiverInfo?.name || 'Unknown Device',
-              date: Date.now(),
-              status: 'Failed',
-              duration: (performance.now() - startTime) / 1000
-            });
-            resolve();
+          if (dc.bufferedAmount > HIGH_WATER) {
+            isPaused = true;
+            pumping = false;
             return;
           }
-        }
-      }
 
-      if (offset >= file.size) {
-        senderHashWorker.onmessage = (e) => {
-          if (e.data.type === 'result') {
-            dc.send(JSON.stringify({ 
-              type: 'eof', 
-              hash: e.data.hash,
-              totalChunks: e.data.chunkCount,
-              fileSize: file.size,
-              transferTime: performance.now() - startTime
-            }));
-            
-            useTransferStore.getState().setReceiverStatus(socketId, 'completed');
-            
-            const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-            useTransferStore.getState().addHistoryRecord({
-              fileName: file.name,
-              size: file.size,
-              mode: 'send',
-              deviceName: receiverInfo?.name || 'Unknown Device',
-              date: Date.now(),
-              status: 'Completed',
-              duration: (performance.now() - startTime) / 1000
-            });
-            senderHashWorker.terminate();
-            resolve();
+          try {
+            if (!nextChunkPromise) prefetch(offset);
+            const chunk = await nextChunkPromise!;
+
+            if (firstChunk) {
+              console.log(`[CHUNK] SEND 0 → ${socketId}`);
+              firstChunk = false;
+            }
+
+            dc.send(chunk);
+            senderHashWorker.postMessage({ type: 'update', chunk });
+            offset += chunk.byteLength;
+            bytesAccum += chunk.byteLength;
+            retryCount = 0;
+
+            const now = performance.now();
+            const elapsed = (now - txStartTime) / 1000;
+            const speed = elapsed > 0 ? offset / elapsed : 0;
+
+            // Adaptive chunk size
+            if (speed > 5 * 1024 * 1024) currentChunkSize = maxChunk;
+            else if (speed > 1 * 1024 * 1024) currentChunkSize = Math.min(256 * 1024, maxChunk);
+            else currentChunkSize = Math.min(128 * 1024, maxChunk);
+
+            prefetch(offset);
+
+            if (now - lastUiUpdate > 250 || offset >= file.size) {
+              useTransferStore.getState().updateReceiverState(socketId, bytesAccum, speed);
+              bytesAccum = 0;
+              lastUiUpdate = now;
+            }
+          } catch (e) {
+            console.error(`[CHUNK] Error sending to ${socketId}:`, e);
+            if (retryCount < 5) {
+              retryCount++;
+              nextChunkPromise = null;
+              await new Promise(r => setTimeout(r, 500));
+            } else {
+              useTransferStore.getState().setReceiverStatus(socketId, 'failed');
+              const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
+              useTransferStore.getState().addHistoryRecord({
+                fileName: file.name, size: file.size, mode: 'send',
+                deviceName: receiverInfo?.name || 'Unknown', date: Date.now(),
+                status: 'Failed', duration: (performance.now() - txStartTime) / 1000,
+              });
+              senderHashWorker.terminate();
+              resolve();
+              return;
+            }
           }
-        };
-        senderHashWorker.postMessage({ type: 'finish' });
-        return;
-      }
-      
-      sending = false;
-    };
+        }
+
+        // EOF
+        if (offset >= file.size) {
+          senderHashWorker.onmessage = (e) => {
+            if (e.data.type === 'result') {
+              dc.send(JSON.stringify({
+                type: 'eof', hash: e.data.hash,
+                totalChunks: e.data.chunkCount,
+                fileSize: file.size,
+                transferTime: performance.now() - txStartTime,
+              }));
+              useTransferStore.getState().setReceiverStatus(socketId, 'completed');
+              const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
+              useTransferStore.getState().addHistoryRecord({
+                fileName: file.name, size: file.size, mode: 'send',
+                deviceName: receiverInfo?.name || 'Unknown', date: Date.now(),
+                status: 'Completed', duration: (performance.now() - txStartTime) / 1000,
+              });
+              senderHashWorker.terminate();
+              resolve();
+            }
+          };
+          senderHashWorker.postMessage({ type: 'finish' });
+          return;
+        }
+
+        pumping = false;
+      };
 
       dc.onbufferedamountlow = () => {
-        if (isPaused) {
-          isPaused = false;
-          pump();
-        }
+        if (isPaused) { isPaused = false; pump(); }
       };
 
       pump();
     };
   });
-};
-
-export const removePeer = (socketId: string) => {
-  const peer = peers.get(socketId);
-  if (peer) {
-    peer.dc?.close();
-    peer.pc?.close();
-    peers.delete(socketId);
-  }
-};
-
-export const closeWebRTC = () => {
-  for (const [, peer] of peers.entries()) {
-    peer.dc?.close();
-    peer.pc?.close();
-  }
-  peers.clear();
-  
-  if (myDataChannel) myDataChannel.close();
-  if (myPeerConnection) myPeerConnection.close();
-  myPeerConnection = null;
-  myDataChannel = null;
 };
