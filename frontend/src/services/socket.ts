@@ -59,7 +59,7 @@ socket.on('receiver_joined', (data: { socketId: string, deviceInfo: DeviceInfo }
 });
 
 // RECEIVER: Sender approved the join request
-socket.on('join_approved', (data) => {
+socket.on('join_approved', () => {
   useRoomStore.getState().setWaitingForApproval(false);
   toast.success('Join request approved!');
 });

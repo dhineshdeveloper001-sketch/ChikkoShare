@@ -1,35 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { motion } from 'framer-motion';
 import { FiClock, FiTrash2, FiSearch } from 'react-icons/fi';
 
-interface TransferHistory {
-  id: string;
-  name: string;
-  size: number;
-  date: number;
-  status: string;
-  speed: number;
-}
+
+
+import { useTransferStore } from '../store/transferStore';
 
 const Dashboard: React.FC = () => {
-  const [history, setHistory] = useState<TransferHistory[]>([]);
+  const history = useTransferStore(state => state.history);
+  const clearHistoryStore = useTransferStore(state => state.clearHistory);
   const [search, setSearch] = useState('');
 
-  useEffect(() => {
-    // In a full implementation, we would use IndexedDB or localStorage to store history when transfers complete.
-    // For now, load from local storage or show empty state.
-    const stored = localStorage.getItem('chikko_history');
-    if (stored) {
-      setHistory(JSON.parse(stored));
-    } else {
-      // Mock data for UI demonstration
-      setHistory([
-        { id: '1', name: 'project_backup.zip', size: 1540000000, date: Date.now() - 3600000, status: 'Completed', speed: 95000000 },
-        { id: '2', name: 'vacation_photos.rar', size: 850000000, date: Date.now() - 86400000, status: 'Completed', speed: 120000000 },
-        { id: '3', name: 'demo_video.mp4', size: 250000000, date: Date.now() - 172800000, status: 'Failed', speed: 45000000 },
-      ]);
-    }
-  }, []);
+
 
   const formatSize = (bytes: number) => {
     if (bytes === 0) return '0 B';
@@ -39,11 +21,10 @@ const Dashboard: React.FC = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  const filteredHistory = history.filter(item => item.name.toLowerCase().includes(search.toLowerCase()));
+  const filteredHistory = history.filter(item => item.fileName.toLowerCase().includes(search.toLowerCase()));
 
   const clearHistory = () => {
-    setHistory([]);
-    localStorage.removeItem('chikko_history');
+    clearHistoryStore();
   };
 
   return (
@@ -84,18 +65,18 @@ const Dashboard: React.FC = () => {
                   <th className="p-4 font-medium">Filename</th>
                   <th className="p-4 font-medium">Size</th>
                   <th className="p-4 font-medium">Date</th>
-                  <th className="p-4 font-medium">Speed</th>
+                  <th className="p-4 font-medium">Device</th>
                   <th className="p-4 font-medium">Status</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredHistory.length > 0 ? (
-                  filteredHistory.map((item, i) => (
+                  filteredHistory.map((item) => (
                     <tr key={item.id} className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors last:border-0">
-                      <td className="p-4 font-medium text-slate-200">{item.name}</td>
+                      <td className="p-4 font-medium text-slate-200">{item.fileName}</td>
                       <td className="p-4 text-slate-400">{formatSize(item.size)}</td>
                       <td className="p-4 text-slate-400">{new Date(item.date).toLocaleDateString()}</td>
-                      <td className="p-4 text-slate-400">{formatSize(item.speed)}/s</td>
+                      <td className="p-4 text-slate-400">{item.deviceName}</td>
                       <td className="p-4">
                         <span className={`px-2 py-1 rounded text-xs font-bold ${
                           item.status === 'Completed' ? 'bg-emerald-500/10 text-emerald-400' :

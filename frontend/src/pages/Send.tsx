@@ -7,7 +7,7 @@ import { startTransferToAll, removePeer } from '../services/webrtc';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
 import type { TransferMode } from '../../../shared/types';
-import toast from 'react-hot-toast';
+
 
 const Send: React.FC = () => {
   const { roomData, pendingRequests, connectedReceivers } = useRoomStore();
@@ -43,12 +43,7 @@ const Send: React.FC = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  const formatTime = (secs: number) => {
-    if (secs === 0 || !isFinite(secs)) return '--:--';
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60);
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
+
 
   const startTransfer = async () => {
     if (connectedReceivers.size === 0) return;

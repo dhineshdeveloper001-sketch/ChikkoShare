@@ -1,6 +1,6 @@
 import { socket } from './socket';
 import { useRoomStore } from '../store/roomStore';
-import { useTransferStore, type TransferStatus } from '../store/transferStore';
+import { useTransferStore } from '../store/transferStore';
 import toast from 'react-hot-toast';
 
 const STUN_SERVERS = [
@@ -108,10 +108,8 @@ export const setupReceiverWebRTC = async (senderSocketId: string) => {
 
   myPeerConnection.onconnectionstatechange = () => {
     if (myPeerConnection?.connectionState === 'connected') {
-      useRoomStore.getState().setPeerConnection(true);
       useTransferStore.getState().setMyStatus('connected');
     } else if (myPeerConnection?.connectionState === 'disconnected' || myPeerConnection?.connectionState === 'failed') {
-      useRoomStore.getState().setPeerConnection(false);
       useTransferStore.getState().setMyStatus('failed');
       toast.error('Connection lost with sender.');
     }
@@ -218,6 +216,17 @@ const finishReceivingFile = async () => {
   
   URL.revokeObjectURL(url);
   toast.success(`Received ${fileMeta.name}`);
+  
+  useTransferStore.getState().addHistoryRecord({
+    fileName: fileMeta.name,
+    size: fileMeta.size,
+    mode: 'receive',
+    deviceName: 'Sender', // Usually we don't have the exact sender name easily here without roomStore cross-referencing, but this is fine.
+    date: Date.now(),
+    status: 'Completed',
+    duration: (performance.now() - startTime) / 1000
+  });
+  
   receiveBuffer = [];
 };
 
@@ -273,6 +282,18 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       if (offset >= file.size) {
         dc.send(JSON.stringify({ type: 'eof' }));
         useTransferStore.getState().setReceiverStatus(socketId, 'completed');
+        
+        const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
+        useTransferStore.getState().addHistoryRecord({
+          fileName: file.name,
+          size: file.size,
+          mode: 'send',
+          deviceName: receiverInfo?.name || 'Unknown Device',
+          date: Date.now(),
+          status: 'Completed',
+          duration: (performance.now() - startTime) / 1000
+        });
+        
         resolve();
         return;
       }
@@ -310,6 +331,16 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
           setTimeout(sendNextChunk, 1000); // Retry after 1s
         } else {
           useTransferStore.getState().setReceiverStatus(socketId, 'failed');
+          const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
+          useTransferStore.getState().addHistoryRecord({
+            fileName: file.name,
+            size: file.size,
+            mode: 'send',
+            deviceName: receiverInfo?.name || 'Unknown Device',
+            date: Date.now(),
+            status: 'Failed',
+            duration: (performance.now() - startTime) / 1000
+          });
           resolve(); // Resolve to not block queue mode forever
         }
       }
@@ -329,7 +360,7 @@ export const removePeer = (socketId: string) => {
 };
 
 export const closeWebRTC = () => {
-  for (const [id, peer] of peers.entries()) {
+  for (const [, peer] of peers.entries()) {
     peer.dc?.close();
     peer.pc?.close();
   }

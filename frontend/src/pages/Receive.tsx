@@ -5,7 +5,7 @@ import { FiCamera, FiCheckCircle, FiClock, FiXCircle } from 'react-icons/fi';
 import { socket, connectSocket } from '../services/socket';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
-import toast from 'react-hot-toast';
+
 
 // Simple device info generator
 const getDeviceInfo = () => {
@@ -36,11 +36,11 @@ const getDeviceInfo = () => {
 };
 
 const Receive: React.FC = () => {
-  const { peerConnected, isWaitingForApproval, approvalRejectedReason, roomData } = useRoomStore();
+  const { isWaitingForApproval, approvalRejectedReason, roomData } = useRoomStore();
   const { myTransferState } = useTransferStore();
   const { status, progress, speedBytesPerSecond, bytesTransferred, etaSeconds } = myTransferState;
   
-  const [roomIdInput, setRoomIdInput] = useState('');
+
   const [scanning, setScanning] = useState(false);
 
   useEffect(() => {
@@ -70,7 +70,7 @@ const Receive: React.FC = () => {
             console.error('Invalid QR');
           }
         },
-        (err) => {}
+        () => {}
       );
       return () => { scanner.clear().catch(e => console.error(e)); };
     }
@@ -135,7 +135,7 @@ const Receive: React.FC = () => {
             <h3 className="text-xl font-bold mb-2">Waiting for Approval</h3>
             <p className="text-slate-400">The sender needs to approve your request to join Room {roomData?.roomId}.</p>
           </div>
-        ) : status === 'idle' && !peerConnected ? (
+        ) : status === 'idle' ? (
           <div className="flex flex-col items-center">
             {scanning ? (
               <div className="w-full max-w-sm mb-6">
