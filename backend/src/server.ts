@@ -104,6 +104,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       createdAt: roomData.createdAt,
       transferMode: roomData.transferMode,
       maxReceivers: roomData.maxReceivers,
+      senderName: roomData.senderName,
+      fileCount: roomData.fileCount,
+      totalSize: roomData.totalSize,
     });
     console.log(`Room created: ${formattedRoomId} by ${socket.id} (Mode: ${roomData.transferMode})`);
   });
