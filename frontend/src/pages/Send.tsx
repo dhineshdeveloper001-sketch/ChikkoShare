@@ -22,6 +22,30 @@ const Send: React.FC = () => {
   useEffect(() => {
     connectSocket();
     useTransferStore.getState().setRole('sender');
+    
+    const checkReclaim = async () => {
+      const room = useRoomStore.getState().roomData;
+      const sessionFiles = sessionStorage.getItem('chikko_files');
+      
+      if (room && sessionFiles) {
+        socket.emit('reclaim_room', { roomId: room.roomId, token: room.token }, (res: any) => {
+          if (res.error) {
+            useRoomStore.getState().reset();
+          } else {
+            toast.success('Session restored! Please re-select your files to resume.');
+            setRoomCreated(true);
+            if (res.approvedReceivers) {
+              res.approvedReceivers.forEach((ar: any) => {
+                useRoomStore.getState().addConnectedReceiver(ar.socketId, ar.deviceInfo);
+              });
+            }
+          }
+        });
+      }
+    };
+    
+    // Tiny delay to ensure socket connects before emitting reclaim
+    setTimeout(checkReclaim, 500);
   }, []);
 
   const handleCreateRoom = () => {
@@ -45,8 +69,22 @@ const Send: React.FC = () => {
   };
 
   const handleFiles = (newFiles: File[]) => {
+    const sessionFilesStr = sessionStorage.getItem('chikko_files');
+    if (sessionFilesStr && roomCreated) {
+       const sessionFiles = JSON.parse(sessionFilesStr);
+       if (newFiles.length !== sessionFiles.length) {
+         return toast.error(`Expected ${sessionFiles.length} files. Please select the correct files to resume.`);
+       }
+       for (let i = 0; i < newFiles.length; i++) {
+         if (newFiles[i].name !== sessionFiles[i].name || newFiles[i].size !== sessionFiles[i].size || newFiles[i].lastModified !== sessionFiles[i].lastModified) {
+           return toast.error(`File mismatch: ${newFiles[i].name}. Please select the exact original files.`);
+         }
+       }
+       toast.success('Files validated! Ready to resume transfer.');
+    }
+
     setSelectedFiles(newFiles);
-    setFiles(newFiles.map(f => ({ name: f.name, size: f.size, type: f.type })));
+    setFiles(newFiles.map(f => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified })));
   };
 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);

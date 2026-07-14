@@ -55,11 +55,14 @@ export interface ServerToClientEvents {
   room_error: (message: string) => void;
   receiver_left: (socketId: string) => void;
   sender_left: () => void;
+  sender_disconnected: () => void; // Sender temporarily disconnected
+  sender_reconnected: (data: { senderSocketId: string }) => void; // Sender came back
   room_full: () => void;
 }
 
 export interface ClientToServerEvents {
   create_room: (data: { transferMode: TransferMode, maxReceivers: number, senderName: string, fileCount: number, totalSize: number }) => void;
+  reclaim_room: (data: { roomId: string, token: string }, callback: (res: { error?: string, roomData?: RoomData, approvedReceivers?: {socketId: string, deviceInfo: DeviceInfo}[] }) => void) => void;
   get_room_metadata: (data: { roomId: string, token: string }, callback: (res: { error?: string, metadata?: RoomMetadata }) => void) => void;
   request_join: (data: JoinRoomRequest) => void; // Receiver asks to join
   approve_request: (data: { roomId: string, receiverSocketId: string }) => void; // Sender approves

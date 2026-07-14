@@ -57,7 +57,8 @@ interface RoomState {
   senderSocketId: string;
   approvedReceivers: Map<string, DeviceInfo>; // socketId -> DeviceInfo
   pendingRequests: Map<string, DeviceInfo>; // socketId -> DeviceInfo
-  timeoutId: NodeJS.Timeout;
+  status: 'active' | 'sender_disconnected';
+  timeoutId: NodeJS.Timeout | null;
 }
 
 const rooms = new Map<string, RoomState>();
@@ -71,14 +72,8 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     const formattedRoomId = `${roomId.substring(0, 4)}-${roomId.substring(4)}`;
     const token = crypto.randomBytes(32).toString('hex');
     
-    const timeoutId = setTimeout(() => {
-      if (rooms.has(formattedRoomId)) {
-        io.to(formattedRoomId).emit('room_error', 'Session Expired.');
-        io.in(formattedRoomId).socketsLeave(formattedRoomId);
-        rooms.delete(formattedRoomId);
-        console.log(`Room ${formattedRoomId} expired.`);
-      }
-    }, ROOM_EXPIRY_MS);
+    let timeoutId: NodeJS.Timeout | null = null;
+    // We will no longer set an initial timeout unless the sender is completely disconnected.
 
     const roomData: RoomState = {
       id: formattedRoomId,
@@ -92,7 +87,8 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       senderSocketId: socket.id,
       approvedReceivers: new Map(),
       pendingRequests: new Map(),
-      timeoutId,
+      status: 'active',
+      timeoutId: null,
     };
 
     rooms.set(formattedRoomId, roomData);
@@ -109,6 +105,47 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       totalSize: roomData.totalSize,
     });
     console.log(`Room created: ${formattedRoomId} by ${socket.id} (Mode: ${roomData.transferMode})`);
+  });
+
+  socket.on('reclaim_room', (data, callback) => {
+    const room = rooms.get(data.roomId);
+    if (!room) {
+      callback({ error: 'Room not found or expired.' });
+      return;
+    }
+    
+    if (room.token !== data.token) {
+      callback({ error: 'Invalid token.' });
+      return;
+    }
+    
+    // Clear timeout if it exists
+    if (room.timeoutId) {
+      clearTimeout(room.timeoutId);
+      room.timeoutId = null;
+    }
+    
+    room.status = 'active';
+    room.senderSocketId = socket.id;
+    socket.join(room.id);
+    
+    // Notify receivers that sender is back
+    io.to(room.id).emit('sender_reconnected', { senderSocketId: socket.id });
+    
+    callback({
+      roomData: {
+        roomId: room.id,
+        token: room.token,
+        createdAt: room.createdAt,
+        transferMode: room.transferMode,
+        maxReceivers: room.maxReceivers,
+        senderName: room.senderName,
+        fileCount: room.fileCount,
+        totalSize: room.totalSize
+      },
+      approvedReceivers: Array.from(room.approvedReceivers.entries()).map(([id, info]) => ({ socketId: id, deviceInfo: info }))
+    });
+    console.log(`Room ${room.id} reclaimed by ${socket.id}`);
   });
 
   socket.on('get_room_metadata', (data, callback) => {
@@ -221,25 +258,43 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
   socket.on('leave_room', (roomId: string) => {
     socket.leave(roomId);
-    handleUserLeave(socket.id, roomId);
+    handleUserLeave(socket.id, roomId, true);
   });
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     for (const [roomId, room] of rooms.entries()) {
-      handleUserLeave(socket.id, roomId);
+      handleUserLeave(socket.id, roomId, false);
     }
   });
 
-  function handleUserLeave(socketId: string, roomId: string) {
+  function handleUserLeave(socketId: string, roomId: string, isExplicit: boolean) {
     const room = rooms.get(roomId);
     if (!room) return;
 
     if (room.senderSocketId === socketId) {
-      socket.to(roomId).emit('sender_left');
-      clearTimeout(room.timeoutId);
-      rooms.delete(roomId);
-      console.log(`Sender left, closing room ${roomId}`);
+      if (isExplicit) {
+        // Explicitly leaving -> close room immediately
+        socket.to(roomId).emit('sender_left');
+        if (room.timeoutId) clearTimeout(room.timeoutId);
+        rooms.delete(roomId);
+        console.log(`Sender explicitly left, closing room ${roomId}`);
+      } else {
+        // Disconnected -> Preserve room for 5 minutes
+        room.status = 'sender_disconnected';
+        socket.to(roomId).emit('sender_disconnected');
+        
+        room.timeoutId = setTimeout(() => {
+          if (rooms.has(roomId)) {
+            io.to(roomId).emit('room_error', 'Session Expired (Sender disconnected).');
+            io.in(roomId).socketsLeave(roomId);
+            rooms.delete(roomId);
+            console.log(`Room ${roomId} expired due to sender disconnection timeout.`);
+          }
+        }, ROOM_EXPIRY_MS);
+        
+        console.log(`Sender disconnected from room ${roomId}. Preserving for 5 mins.`);
+      }
     } else {
       if (room.approvedReceivers.has(socketId)) {
         room.approvedReceivers.delete(socketId);

@@ -7,6 +7,7 @@ export interface FileMetadata {
   name: string;
   size: number;
   type: string;
+  lastModified?: number;
 }
 
 export interface ReceiverTransferState {
@@ -87,10 +88,15 @@ export const useTransferStore = create<TransferState>()(
       
       history: [],
 
-      setRole: (role) => set({ role }),
+      setRole: (role) => {
+        if (role) sessionStorage.setItem('chikko_role', role);
+        else sessionStorage.removeItem('chikko_role');
+        set({ role });
+      },
       setSenderStatus: (status) => set({ senderStatus: status }),
       setFiles: (files) => {
         const totalBytes = files.reduce((acc, file) => acc + file.size, 0);
+        sessionStorage.setItem('chikko_files', JSON.stringify(files));
         set({ files, totalBytes });
       },
 
@@ -154,14 +160,18 @@ export const useTransferStore = create<TransferState>()(
       
       clearHistory: () => set({ history: [] }),
 
-      reset: () => set({
-        role: null,
-        files: [],
-        totalBytes: 0,
-        senderStatus: 'idle',
-        receiverStates: new Map(),
-        myTransferState: { ...defaultReceiverState },
-      })
+      reset: () => {
+        sessionStorage.removeItem('chikko_role');
+        sessionStorage.removeItem('chikko_files');
+        set({
+          role: null,
+          files: [],
+          totalBytes: 0,
+          senderStatus: 'idle',
+          receiverStates: new Map(),
+          myTransferState: { ...defaultReceiverState },
+        });
+      }
     }),
     {
       name: 'chikko-transfer-storage',

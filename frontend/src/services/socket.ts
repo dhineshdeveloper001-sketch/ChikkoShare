@@ -85,10 +85,26 @@ socket.on('receiver_left', (socketId: string) => {
   removePeer(socketId);
 });
 
-// RECEIVER: Sender left
+// RECEIVER: Sender left completely
 socket.on('sender_left', () => {
-  toast.error('Sender disconnected. Room closed.');
+  toast.error('Sender disconnected completely. Room closed.');
   closeWebRTC();
   useRoomStore.getState().reset();
   useTransferStore.getState().reset();
+});
+
+// RECEIVER: Sender temporarily disconnected
+socket.on('sender_disconnected', () => {
+  useRoomStore.getState().setSenderDisconnected(true);
+  toast.error('Sender disconnected. Waiting for reconnection...', { duration: 5000 });
+});
+
+// RECEIVER: Sender reconnected
+socket.on('sender_reconnected', () => {
+  useRoomStore.getState().setSenderDisconnected(false);
+  toast.success('Sender reconnected! Resuming...');
+  
+  // Send the sync_offset message to the sender so they can resume
+  // Wait, WebRTC connections were probably broken. We should expect a new offer from the sender!
+  // The sender will initiateWebRTCConnection when they reclaim.
 });

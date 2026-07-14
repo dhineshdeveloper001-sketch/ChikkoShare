@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { RoomData, PendingRequest, DeviceInfo } from '../../../shared/types';
+import { persist, createJSONStorage } from 'zustand/middleware';
 
 interface RoomState {
   roomData: RoomData | null;
@@ -13,6 +14,7 @@ interface RoomState {
   isWaitingForApproval: boolean;
   approvalRejectedReason: string | null;
   myDeviceInfo: DeviceInfo | null;
+  senderDisconnected: boolean;
   
   setRoomData: (data: RoomData | null) => void;
   setSignalingConnection: (isConnected: boolean) => void;
@@ -25,11 +27,14 @@ interface RoomState {
   setWaitingForApproval: (isWaiting: boolean) => void;
   setApprovalRejected: (reason: string | null) => void;
   setMyDeviceInfo: (info: DeviceInfo) => void;
+  setSenderDisconnected: (disconnected: boolean) => void;
   
   reset: () => void;
 }
 
-export const useRoomStore = create<RoomState>((set) => ({
+export const useRoomStore = create<RoomState>()(
+  persist(
+    (set) => ({
   roomData: null,
   isConnectedToSignaling: false,
   
@@ -39,6 +44,7 @@ export const useRoomStore = create<RoomState>((set) => ({
   isWaitingForApproval: false,
   approvalRejectedReason: null,
   myDeviceInfo: null,
+  senderDisconnected: false,
 
   setRoomData: (data) => set({ roomData: data }),
   setSignalingConnection: (isConnectedToSignaling) => set({ isConnectedToSignaling }),
@@ -68,6 +74,7 @@ export const useRoomStore = create<RoomState>((set) => ({
   setWaitingForApproval: (isWaiting) => set({ isWaitingForApproval: isWaiting }),
   setApprovalRejected: (reason) => set({ approvalRejectedReason: reason }),
   setMyDeviceInfo: (info) => set({ myDeviceInfo: info }),
+  setSenderDisconnected: (disconnected) => set({ senderDisconnected: disconnected }),
   
   reset: () => set({ 
     roomData: null, 
@@ -75,5 +82,12 @@ export const useRoomStore = create<RoomState>((set) => ({
     connectedReceivers: new Map(),
     isWaitingForApproval: false,
     approvalRejectedReason: null,
+    senderDisconnected: false,
   })
-}));
+  }),
+  {
+    name: 'chikko-room-session',
+    storage: createJSONStorage(() => sessionStorage),
+    partialize: (state) => ({ roomData: state.roomData }), // Only persist roomData to session storage
+  }
+));

@@ -44,7 +44,7 @@ interface ScannedQRData {
 }
 
 const Receive: React.FC = () => {
-  const { isWaitingForApproval, approvalRejectedReason, roomData } = useRoomStore();
+  const { isWaitingForApproval, approvalRejectedReason, roomData, senderDisconnected } = useRoomStore();
   const { myTransferState } = useTransferStore();
   const { status, progress, speedBytesPerSecond, bytesTransferred, etaSeconds } = myTransferState;
   
@@ -272,6 +272,21 @@ const Receive: React.FC = () => {
   };
 
   const renderContent = () => {
+    if (senderDisconnected) {
+      return (
+        <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="flex flex-col items-center justify-center h-full text-center p-6 w-full max-w-md mx-auto">
+          <div className="w-20 h-20 bg-yellow-500/10 rounded-full flex items-center justify-center mb-6 shadow-[0_0_15px_rgba(234,179,8,0.2)]">
+            <FiClock className="text-4xl text-yellow-500 animate-pulse" />
+          </div>
+          <h2 className="text-2xl font-bold text-white mb-2">Sender Disconnected</h2>
+          <p className="text-slate-400 mb-6 leading-relaxed">The sender has lost connection. Waiting up to 5 minutes for them to reconnect...</p>
+          <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div className="h-full bg-yellow-500/50 w-full animate-[progress_2s_ease-in-out_infinite]" />
+          </div>
+        </motion.div>
+      );
+    }
+  
     if (approvalRejectedReason) {
       return (
         <div className="flex flex-col items-center text-center p-8 text-red-400">

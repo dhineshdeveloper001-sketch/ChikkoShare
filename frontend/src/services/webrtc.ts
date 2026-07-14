@@ -53,8 +53,20 @@ export const initiateWebRTCConnection = async (receiverSocketId: string) => {
         peer.status = 'connected';
       } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
         peer.status = 'disconnected';
-        useTransferStore.getState().setReceiverStatus(receiverSocketId, 'failed');
-        toast.error('Connection lost with a receiver.');
+        if (pc.signalingState !== 'closed') {
+           console.log(`Attempting ICE restart for ${receiverSocketId}`);
+           pc.createOffer({ iceRestart: true }).then(offer => {
+             return pc.setLocalDescription(offer);
+           }).then(() => {
+             const roomId = useRoomStore.getState().roomData?.roomId;
+             if (roomId) {
+               socket.emit('signaling_message', { roomId, targetSocketId: receiverSocketId, type: 'offer', payload: pc.localDescription });
+             }
+           }).catch(() => {
+             useTransferStore.getState().setReceiverStatus(receiverSocketId, 'failed');
+             toast.error('Connection lost with a receiver.');
+           });
+        }
       }
     };
 
@@ -182,14 +194,19 @@ const handleIncomingData = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data);
       if (data.type === 'metadata') {
-        fileMeta = data;
-        receiveBuffer = [];
-        receivedSize = 0;
-        receiverBytesAccumulated = 0;
-        startTime = performance.now();
-        lastReceiverUiUpdate = startTime;
-        useTransferStore.getState().setMyStatus('transferring');
-        useTransferStore.getState().setFiles([{ name: fileMeta.name, size: fileMeta.size, type: fileMeta.fileType }]);
+        if (fileMeta && fileMeta.name === data.name && fileMeta.size === data.size && receivedSize > 0) {
+          console.log(`Resuming file transfer from offset ${receivedSize}`);
+        } else {
+          fileMeta = data;
+          receiveBuffer = [];
+          receivedSize = 0;
+          receiverBytesAccumulated = 0;
+          startTime = performance.now();
+          lastReceiverUiUpdate = startTime;
+          useTransferStore.getState().setMyStatus('transferring');
+          useTransferStore.getState().setFiles([{ name: fileMeta.name, size: fileMeta.size, type: fileMeta.fileType }]);
+        }
+        myDataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: receivedSize }));
       } else if (data.type === 'eof') {
         // Final UI update
         const elapsedSec = (performance.now() - startTime) / 1000;
@@ -279,45 +296,61 @@ export const startTransferToAll = async (file: File) => {
 
 const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promise<void> => {
   return new Promise((resolve) => {
-    let offset = 0;
-    const startTime = performance.now();
-    let retryCount = 0;
     
-    let lastUiUpdate = performance.now();
-    let bytesAddedSinceLastUpdate = 0;
-    
-    dc.bufferedAmountLowThreshold = 1024 * 1024; // 1 MB
-    let isPaused = false;
-    let sending = false;
-    
-    const readSlice = (o: number, size: number): Promise<ArrayBuffer> => {
-      return new Promise<ArrayBuffer>((res, rej) => {
-        const reader = new FileReader();
-        reader.onload = (e) => res(e.target?.result as ArrayBuffer);
-        reader.onerror = rej;
-        reader.readAsArrayBuffer(file.slice(o, o + size));
-      });
-    };
-
-    const getAdaptiveChunkSize = (speed: number) => {
-      if (speed < 1 * 1024 * 1024) return 128 * 1024; // Slow: 128KB
-      if (speed < 5 * 1024 * 1024) return 256 * 1024; // Medium: 256KB
-      return 512 * 1024; // Fast: 512KB
-    };
-
-    let nextChunkPromise: Promise<ArrayBuffer> | null = null;
-    let currentChunkSize = 128 * 1024;
-    
-    const prefetchNextChunk = (o: number, size: number) => {
-      if (o < file.size) {
-        nextChunkPromise = readSlice(o, Math.min(size, file.size - o));
-      } else {
-        nextChunkPromise = null;
+    // Listen for sync_offset before pumping
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data === 'string') {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'sync_offset') {
+            dc.removeEventListener('message', onMessage);
+            startPumping(data.offset || 0);
+          }
+        } catch(e) {}
       }
     };
+    dc.addEventListener('message', onMessage);
 
-    // Initial prefetch
-    prefetchNextChunk(offset, currentChunkSize);
+    const startPumping = (initialOffset: number) => {
+      let offset = initialOffset;
+      const startTime = performance.now();
+      let retryCount = 0;
+      
+      let lastUiUpdate = performance.now();
+      let bytesAddedSinceLastUpdate = 0;
+      
+      dc.bufferedAmountLowThreshold = 1024 * 1024; // 1 MB
+      let isPaused = false;
+      let sending = false;
+      
+      const readSlice = (o: number, size: number): Promise<ArrayBuffer> => {
+        return new Promise<ArrayBuffer>((res, rej) => {
+          const reader = new FileReader();
+          reader.onload = (e) => res(e.target?.result as ArrayBuffer);
+          reader.onerror = rej;
+          reader.readAsArrayBuffer(file.slice(o, o + size));
+        });
+      };
+
+      const getAdaptiveChunkSize = (speed: number) => {
+        if (speed < 1 * 1024 * 1024) return 128 * 1024; // Slow: 128KB
+        if (speed < 5 * 1024 * 1024) return 256 * 1024; // Medium: 256KB
+        return 512 * 1024; // Fast: 512KB
+      };
+
+      let nextChunkPromise: Promise<ArrayBuffer> | null = null;
+      let currentChunkSize = 128 * 1024;
+      
+      const prefetchNextChunk = (o: number, size: number) => {
+        if (o < file.size) {
+          nextChunkPromise = readSlice(o, Math.min(size, file.size - o));
+        } else {
+          nextChunkPromise = null;
+        }
+      };
+
+      // Initial prefetch
+      prefetchNextChunk(offset, currentChunkSize);
 
     const pump = async () => {
       if (sending) return;
@@ -400,14 +433,15 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       sending = false;
     };
 
-    dc.onbufferedamountlow = () => {
-      if (isPaused) {
-        isPaused = false;
-        pump();
-      }
-    };
+      dc.onbufferedamountlow = () => {
+        if (isPaused) {
+          isPaused = false;
+          pump();
+        }
+      };
 
-    pump();
+      pump();
+    };
   });
 };
 
