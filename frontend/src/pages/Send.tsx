@@ -282,13 +282,19 @@ const Send: React.FC = () => {
                           <div className="text-xl font-bold text-slate-200 mb-2">{files.length} File(s) Ready to Send</div>
                           <div className="text-slate-400">{formatSize(totalBytes)} total</div>
                         </div>
-                        <button 
-                          onClick={startTransfer}
-                          disabled={connectedReceivers.size === 0}
-                          className="w-full max-w-sm px-6 py-4 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 text-white font-bold rounded-xl transition-colors shadow-lg shadow-blue-500/20"
-                        >
-                          Start Sending to {connectedReceivers.size} Receiver(s)
-                        </button>
+                        <div className="flex flex-col gap-4 items-center w-full max-w-sm">
+                          {connectedReceivers.size === 0 ? (
+                            <div className="flex items-center gap-3 px-6 py-4 bg-slate-800 text-slate-300 font-medium rounded-xl w-full justify-center shadow-inner">
+                              <span className="animate-spin h-5 w-5 border-2 border-slate-500 border-t-slate-300 rounded-full" />
+                              Waiting for receivers to join...
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-3 px-6 py-4 bg-blue-600/20 text-blue-400 font-bold rounded-xl w-full justify-center border border-blue-500/30">
+                              <span className="animate-pulse h-3 w-3 bg-blue-400 rounded-full" />
+                              Establishing connection...
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                  </div>
