@@ -22,6 +22,11 @@ const peers = new Map<string, PeerInstance>();
 let myPeerConnection: RTCPeerConnection | null = null;
 let myDataChannel: RTCDataChannel | null = null;
 
+export const clearPeers = () => {
+  peers.forEach(p => p.pc.close());
+  peers.clear();
+};
+
 // For Sender Role: Initiate connection to a specific receiver
 export const initiateWebRTCConnection = async (receiverSocketId: string) => {
   try {

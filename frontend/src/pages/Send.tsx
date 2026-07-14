@@ -4,7 +4,7 @@ import { motion } from 'framer-motion';
 import { FiUploadCloud, FiCheck, FiX, FiActivity, FiSettings, FiTrash2 } from 'react-icons/fi';
 import toast from 'react-hot-toast';
 import { socket, connectSocket } from '../services/socket';
-import { startTransferToAll, removePeer } from '../services/webrtc';
+import { startTransferToAll, removePeer, clearPeers } from '../services/webrtc';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
 import type { TransferMode } from '../../../shared/types';
@@ -50,6 +50,13 @@ const Send: React.FC = () => {
 
   const handleCreateRoom = () => {
     if (selectedFiles.length === 0) return toast.error('Please select at least one file to send.');
+    
+    clearPeers();
+    useRoomStore.getState().reset();
+    useTransferStore.getState().reset();
+    // Re-apply role and files since reset clears them
+    useTransferStore.getState().setRole('sender');
+    useTransferStore.getState().setFiles(selectedFiles.map(f => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified })));
     
     // Generate a sender name if not existing
     let senderName = localStorage.getItem('chikko_device_name');
@@ -108,13 +115,15 @@ const Send: React.FC = () => {
   // Auto-start transfer once connections are established
   useEffect(() => {
     if (selectedFiles.length > 0 && connectedReceivers.size > 0 && senderStatus === 'idle') {
-      // Check if any receiver is actually in 'connected' state
-      const anyReady = Array.from(receiverStates.values()).some(s => s.status === 'connected');
-      if (anyReady) {
+      // Check if any of the *currently connected* receivers are ready
+      const anyCurrentReady = Array.from(connectedReceivers.keys()).some(socketId => 
+        receiverStates.get(socketId)?.status === 'connected'
+      );
+      if (anyCurrentReady) {
         startTransfer();
       }
     }
-  }, [selectedFiles, connectedReceivers.size, senderStatus, receiverStates]);
+  }, [selectedFiles, connectedReceivers.size, senderStatus, receiverStates, connectedReceivers]);
 
   const approveRequest = (socketId: string) => {
     if (!roomData) return;
