@@ -107,18 +107,46 @@ const Send: React.FC = () => {
 
 
   const startTransfer = async () => {
-    if (connectedReceivers.size === 0) return;
-    if (selectedFiles.length === 0) return;
-    await startTransferToAll(selectedFiles[0]);
+    console.log('[SEND] startTransfer called:', {
+      selectedFilesCount: selectedFiles.length,
+      connectedReceiversSize: connectedReceivers.size,
+      senderStatus,
+    });
+    if (connectedReceivers.size === 0) {
+      console.warn('[SEND] Aborted: no connected receivers');
+      return;
+    }
+    if (selectedFiles.length === 0) {
+      console.warn('[SEND] Aborted: no selected files (actual File objects)');
+      return;
+    }
+    const file = selectedFiles[0];
+    console.log('[SEND] Calling startTransferToAll with file:', file.name, file.size);
+    try {
+      await startTransferToAll(file);
+    } catch (err) {
+      console.error('[SEND] startTransferToAll threw:', err);
+    }
   };
 
   // Auto-start transfer once connections are established
   useEffect(() => {
+    const currentReceiverStates = Array.from(connectedReceivers.keys()).map(id => ({
+      id,
+      status: receiverStates.get(id)?.status,
+    }));
+    console.log('[SEND] Auto-start check:', {
+      selectedFilesCount: selectedFiles.length,
+      connectedReceiversSize: connectedReceivers.size,
+      senderStatus,
+      receiverStatuses: currentReceiverStates,
+    });
+
     if (selectedFiles.length > 0 && connectedReceivers.size > 0 && senderStatus === 'idle') {
-      // Check if any of the *currently connected* receivers are ready
-      const anyCurrentReady = Array.from(connectedReceivers.keys()).some(socketId => 
+      const anyCurrentReady = Array.from(connectedReceivers.keys()).some(socketId =>
         receiverStates.get(socketId)?.status === 'connected'
       );
+      console.log('[SEND] anyCurrentReady:', anyCurrentReady);
       if (anyCurrentReady) {
         startTransfer();
       }

@@ -300,47 +300,53 @@ const finishReceivingFile = async () => {
 // --- CHUNK SCHEDULER (Sender Side) ---
 export const startTransferToAll = async (file: File) => {
   const mode = useRoomStore.getState().roomData?.transferMode;
-  useTransferStore.getState().setSenderStatus('transferring');
-  
-  // Prepare receivers
+
+  // Prepare receivers — check OPEN DataChannels
   const activePeers = Array.from(peers.entries()).filter(([_, p]) => p.dc?.readyState === 'open');
+  console.log(`[WEBRTC] START CHECK: file=${file.name}, activePeers=${activePeers.length}, peersTotal=${peers.size}`);
   if (activePeers.length === 0) {
-    toast.error('No ready connections to send to.');
+    console.error('[WEBRTC] No open DataChannels found. Aborting.');
+    // Log each peer's dc state for debugging
+    peers.forEach((p, id) => console.warn(`  peer ${id}: dc.readyState=${p.dc?.readyState ?? 'null'}`));
     useTransferStore.getState().setSenderStatus('failed');
+    toast.error('Connection not ready. Please wait and try again.');
     return;
   }
 
-  const metadata = JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type });
-  console.log(`[WEBRTC] TRANSFER START: ${file.name} to ${activePeers.length} peers`);
+  useTransferStore.getState().setSenderStatus('transferring');
+  console.log(`[WEBRTC] TRANSFER START: ${file.name} → ${activePeers.length} peer(s), mode=${mode}`);
 
   if (mode === 'queue') {
-    // Sequential
+    // Sequential — sendFileToPeer sends its own metadata after registering listener
     for (const [socketId, peer] of activePeers) {
-      peer.dc!.send(metadata);
       useTransferStore.getState().setReceiverStatus(socketId, 'transferring');
       await sendFileToPeer(file, socketId, peer.dc!);
     }
   } else {
     // Broadcast & Private (Parallel)
-    for (const [socketId, peer] of activePeers) {
-      peer.dc!.send(metadata);
+    const promises = activePeers.map(([socketId, peer]) => {
       useTransferStore.getState().setReceiverStatus(socketId, 'transferring');
-      // Fire and forget (they will run in parallel)
-      sendFileToPeer(file, socketId, peer.dc!);
-    }
+      return sendFileToPeer(file, socketId, peer.dc!);
+    });
+    await Promise.all(promises);
   }
 };
 
 const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promise<void> => {
   return new Promise((resolve) => {
-    
-    // Listen for sync_offset before pumping
+    console.log(`[WEBRTC] sendFileToPeer: registering sync_offset listener for ${socketId}`);
+
+    // Handshake Timeout & Retry
+    let retryTimeout: ReturnType<typeof setTimeout>;
+    let abortTimeout: ReturnType<typeof setTimeout>;
+
+    // STEP 1: Register the sync_offset listener FIRST
     const onMessage = (event: MessageEvent) => {
       if (typeof event.data === 'string') {
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'sync_offset') {
-            console.log(`[WEBRTC] SYNC_OFFSET RECEIVED: ${data.offset}`);
+            console.log(`[WEBRTC] SYNC_OFFSET RECEIVED from ${socketId}: offset=${data.offset}`);
             clearTimeout(retryTimeout);
             clearTimeout(abortTimeout);
             dc.removeEventListener('message', onMessage);
@@ -352,27 +358,29 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       }
     };
     dc.addEventListener('message', onMessage);
-    
-    // Handshake Timeout & Retry
-    let retryTimeout: ReturnType<typeof setTimeout>;
-    let abortTimeout: ReturnType<typeof setTimeout>;
-    
+
+    // STEP 2: Send metadata AFTER listener is attached
     const sendMetadata = () => {
-      dc.send(JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type }));
+      const meta = JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type });
+      console.log(`[WEBRTC] METADATA SEND to ${socketId}: ${file.name} (${file.size} bytes)`);
+      dc.send(meta);
     };
-    
+
+    sendMetadata(); // Send immediately after listener is registered
+
+    // Retry if no sync_offset within 8 seconds
     retryTimeout = setTimeout(() => {
-      console.warn(`[WEBRTC] sync_offset timeout. Retrying metadata to ${socketId}`);
+      console.warn(`[WEBRTC] sync_offset timeout (8s). Retrying metadata to ${socketId}`);
       sendMetadata();
-      
+
       abortTimeout = setTimeout(() => {
-        console.error(`[WEBRTC] Handshake failed for ${socketId}`);
+        console.error(`[WEBRTC] Handshake permanently failed for ${socketId} after retry`);
         dc.removeEventListener('message', onMessage);
         useTransferStore.getState().setReceiverStatus(socketId, 'failed');
         toast.error('Receiver initialization failed. Please reconnect.');
         resolve();
-      }, 10000);
-    }, 10000);
+      }, 8000);
+    }, 8000);
 
     const startPumping = (initialOffset: number) => {
       const senderHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
