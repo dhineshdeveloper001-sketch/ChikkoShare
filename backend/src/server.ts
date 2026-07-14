@@ -7,6 +7,7 @@ import compression from 'compression';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import path from 'path';
+import fs from 'fs';
 
 // Import shared types
 import {
@@ -27,7 +28,17 @@ app.use(cors());
 app.use(compression());
 app.use(express.json());
 
-const publicPath = path.join(process.cwd(), 'public');
+let publicPath = path.join(process.cwd(), 'public');
+if (!fs.existsSync(publicPath)) {
+  publicPath = path.join(__dirname, '../public'); // Local dev: backend/src/../public
+  if (!fs.existsSync(publicPath)) {
+    publicPath = path.join(__dirname, '../../../public'); // Prod: backend/dist/backend/src/../../../public
+  }
+  if (!fs.existsSync(publicPath)) {
+     publicPath = path.join(process.cwd(), 'backend/public'); // Fallback for root execution
+  }
+}
+
 app.use(express.static(publicPath));
 
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
@@ -213,7 +224,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
 app.use((req, res, next) => {
   if (req.method !== 'GET') return next();
-  res.sendFile(path.join(process.cwd(), 'public/index.html'), (err) => {
+  res.sendFile(path.join(publicPath, 'index.html'), (err) => {
     if (err) res.status(500).send('Static files not built yet.');
   });
 });
