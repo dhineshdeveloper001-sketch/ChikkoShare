@@ -75,6 +75,7 @@ export const initiateWebRTCConnection = async (receiverSocketId: string) => {
     
     dc.binaryType = 'arraybuffer';
     dc.onopen = () => {
+      console.log(`[WEBRTC] DATACHANNEL OPEN for ${receiverSocketId}`);
       useTransferStore.getState().setReceiverStatus(receiverSocketId, 'connected');
     };
     dc.onclose = () => {
@@ -132,7 +133,7 @@ export const setupReceiverWebRTC = async (senderSocketId: string) => {
     myDataChannel.binaryType = 'arraybuffer';
     
     myDataChannel.onopen = () => {
-      console.log('Data channel open!');
+      console.log('[WEBRTC] DATACHANNEL OPEN (Receiver)');
       useTransferStore.getState().setMyStatus('connected');
     };
     
@@ -195,6 +196,7 @@ const handleIncomingData = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data);
       if (data.type === 'metadata') {
+        console.log(`[WEBRTC] METADATA RECEIVED: ${data.name} (${data.size} bytes)`);
         if (!receiverHashWorker) {
           receiverHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
           receiverHashWorker.postMessage({ type: 'init' });
@@ -214,6 +216,7 @@ const handleIncomingData = (event: MessageEvent) => {
           useTransferStore.getState().setMyStatus('transferring');
           useTransferStore.getState().setFiles([{ name: fileMeta.name, size: fileMeta.size, type: fileMeta.fileType }]);
         }
+        console.log(`[WEBRTC] SENDING SYNC_OFFSET: ${receivedSize}`);
         myDataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: receivedSize }));
       } else if (data.type === 'eof') {
         const elapsedSec = (performance.now() - startTime) / 1000;
@@ -240,9 +243,12 @@ const handleIncomingData = (event: MessageEvent) => {
           finishReceivingFile();
         }
       }
-    } catch(e) {}
+    } catch (e) {
+      console.error('[WEBRTC] Error processing incoming message:', e);
+    }
   } else {
     const chunk = event.data as ArrayBuffer;
+    if (receivedSize === 0) console.log(`[WEBRTC] RECEIVE CHUNK 0`);
     receiveBuffer.push(chunk);
     receiverHashWorker?.postMessage({ type: 'update', chunk });
     receivedSize += chunk.byteLength;
@@ -300,6 +306,7 @@ export const startTransferToAll = async (file: File) => {
   }
 
   const metadata = JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type });
+  console.log(`[WEBRTC] TRANSFER START: ${file.name} to ${activePeers.length} peers`);
 
   if (mode === 'queue') {
     // Sequential
@@ -328,13 +335,39 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'sync_offset') {
+            console.log(`[WEBRTC] SYNC_OFFSET RECEIVED: ${data.offset}`);
+            clearTimeout(retryTimeout);
+            clearTimeout(abortTimeout);
             dc.removeEventListener('message', onMessage);
             startPumping(data.offset || 0);
           }
-        } catch(e) {}
+        } catch (e) {
+          console.error('[WEBRTC] Error processing handshake message:', e);
+        }
       }
     };
     dc.addEventListener('message', onMessage);
+    
+    // Handshake Timeout & Retry
+    let retryTimeout: ReturnType<typeof setTimeout>;
+    let abortTimeout: ReturnType<typeof setTimeout>;
+    
+    const sendMetadata = () => {
+      dc.send(JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type }));
+    };
+    
+    retryTimeout = setTimeout(() => {
+      console.warn(`[WEBRTC] sync_offset timeout. Retrying metadata to ${socketId}`);
+      sendMetadata();
+      
+      abortTimeout = setTimeout(() => {
+        console.error(`[WEBRTC] Handshake failed for ${socketId}`);
+        dc.removeEventListener('message', onMessage);
+        useTransferStore.getState().setReceiverStatus(socketId, 'failed');
+        toast.error('Receiver initialization failed. Please reconnect.');
+        resolve();
+      }, 10000);
+    }, 10000);
 
     const startPumping = (initialOffset: number) => {
       const senderHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
@@ -361,9 +394,21 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       };
 
       const getAdaptiveChunkSize = (speed: number) => {
-        if (speed < 1 * 1024 * 1024) return 128 * 1024; // Slow: 128KB
-        if (speed < 5 * 1024 * 1024) return 256 * 1024; // Medium: 256KB
-        return 512 * 1024; // Fast: 512KB
+        let desired = 128 * 1024;
+        if (speed < 1 * 1024 * 1024) desired = 128 * 1024;
+        else if (speed < 5 * 1024 * 1024) desired = 256 * 1024;
+        else desired = 512 * 1024;
+        
+        // Clamp based on receiver browser
+        const receiver = useRoomStore.getState().connectedReceivers.get(socketId);
+        const browser = (receiver?.browser || '').toLowerCase();
+        
+        let maxSafeSize = 128 * 1024; // Default safe limit
+        if (browser.includes('safari')) maxSafeSize = 64 * 1024;
+        else if (browser.includes('firefox')) maxSafeSize = 128 * 1024;
+        else if (browser.includes('chrome') || browser.includes('edge')) maxSafeSize = 256 * 1024;
+        
+        return Math.min(desired, maxSafeSize);
       };
 
       let nextChunkPromise: Promise<ArrayBuffer> | null = null;
@@ -380,15 +425,17 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       // Initial prefetch
       prefetchNextChunk(offset, currentChunkSize);
 
-    const pump = async () => {
-      if (sending) return;
-      sending = true;
+      let firstChunkLogged = false;
 
-      while (offset < file.size) {
-        if (dc.readyState !== 'open') {
-           resolve();
-           return;
-        }
+      const pump = async () => {
+        if (sending) return;
+        sending = true;
+
+        while (offset < file.size) {
+          if (dc.readyState !== 'open') {
+             resolve();
+             return;
+          }
 
         if (dc.bufferedAmount > dc.bufferedAmountLowThreshold) {
           isPaused = true;
@@ -399,6 +446,11 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
         try {
           if (!nextChunkPromise) prefetchNextChunk(offset, currentChunkSize);
           const chunk = await nextChunkPromise!;
+          
+          if (!firstChunkLogged) {
+             console.log(`[WEBRTC] SEND CHUNK 0`);
+             firstChunkLogged = true;
+          }
           
           dc.send(chunk);
           senderHashWorker.postMessage({ type: 'update', chunk });

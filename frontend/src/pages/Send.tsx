@@ -105,6 +105,17 @@ const Send: React.FC = () => {
     await startTransferToAll(selectedFiles[0]);
   };
 
+  // Auto-start transfer once connections are established
+  useEffect(() => {
+    if (selectedFiles.length > 0 && connectedReceivers.size > 0 && senderStatus === 'idle') {
+      // Check if any receiver is actually in 'connected' state
+      const anyReady = Array.from(receiverStates.values()).some(s => s.status === 'connected');
+      if (anyReady) {
+        startTransfer();
+      }
+    }
+  }, [selectedFiles, connectedReceivers.size, senderStatus, receiverStates]);
+
   const approveRequest = (socketId: string) => {
     if (!roomData) return;
     socket.emit('approve_request', { roomId: roomData.roomId, receiverSocketId: socketId });
