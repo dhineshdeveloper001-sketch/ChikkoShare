@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "copy-static": "node -e \"fs.cpSync('../frontend/dist', 'public', {recursive: true})\"",
-    "start": "node dist/server.js",
+    "start": "node dist/backend/src/server.js",
     "dev": "nodemon src/server.ts"
   },
   "keywords": [],
