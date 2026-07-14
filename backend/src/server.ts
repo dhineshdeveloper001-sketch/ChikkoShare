@@ -27,7 +27,7 @@ app.use(cors());
 app.use(compression());
 app.use(express.json());
 
-const publicPath = path.join(__dirname, '../public');
+const publicPath = path.join(process.cwd(), 'public');
 app.use(express.static(publicPath));
 
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
@@ -213,7 +213,7 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
 app.use((req, res, next) => {
   if (req.method !== 'GET') return next();
-  res.sendFile(path.join(__dirname, '../public/index.html'), (err) => {
+  res.sendFile(path.join(process.cwd(), 'public/index.html'), (err) => {
     if (err) res.status(500).send('Static files not built yet.');
   });
 });
