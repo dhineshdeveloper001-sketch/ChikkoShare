@@ -119,11 +119,13 @@ const Send: React.FC = () => {
   const approveRequest = (socketId: string) => {
     if (!roomData) return;
     socket.emit('approve_request', { roomId: roomData.roomId, receiverSocketId: socketId });
+    useRoomStore.getState().removePendingRequest(socketId);
   };
 
   const rejectRequest = (socketId: string) => {
     if (!roomData) return;
     socket.emit('reject_request', { roomId: roomData.roomId, receiverSocketId: socketId, reason: 'Sender rejected.' });
+    useRoomStore.getState().removePendingRequest(socketId);
   };
 
   const handleDisconnectReceiver = (socketId: string) => {
