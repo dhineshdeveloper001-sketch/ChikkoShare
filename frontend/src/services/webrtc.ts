@@ -174,6 +174,8 @@ let receiveBuffer: ArrayBuffer[] = [];
 let receivedSize = 0;
 let fileMeta: any = null;
 let startTime = 0;
+let lastReceiverUiUpdate = 0;
+let receiverBytesAccumulated = 0;
 
 const handleIncomingData = (event: MessageEvent) => {
   if (typeof event.data === 'string') {
@@ -183,12 +185,18 @@ const handleIncomingData = (event: MessageEvent) => {
         fileMeta = data;
         receiveBuffer = [];
         receivedSize = 0;
+        receiverBytesAccumulated = 0;
         startTime = performance.now();
+        lastReceiverUiUpdate = startTime;
         useTransferStore.getState().setMyStatus('transferring');
-        
-        // Also setup files in store for UI
         useTransferStore.getState().setFiles([{ name: fileMeta.name, size: fileMeta.size, type: fileMeta.fileType }]);
       } else if (data.type === 'eof') {
+        // Final UI update
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
+        useTransferStore.getState().updateMyState(receiverBytesAccumulated, speed);
+        receiverBytesAccumulated = 0;
+        
         finishReceivingFile();
       }
     } catch(e) {}
@@ -196,10 +204,16 @@ const handleIncomingData = (event: MessageEvent) => {
     const chunk = event.data as ArrayBuffer;
     receiveBuffer.push(chunk);
     receivedSize += chunk.byteLength;
+    receiverBytesAccumulated += chunk.byteLength;
     
-    const elapsedSec = (performance.now() - startTime) / 1000;
-    const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
-    useTransferStore.getState().updateMyState(chunk.byteLength, speed);
+    const now = performance.now();
+    if (now - lastReceiverUiUpdate > 250) {
+      const elapsedSec = (now - startTime) / 1000;
+      const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
+      useTransferStore.getState().updateMyState(receiverBytesAccumulated, speed);
+      receiverBytesAccumulated = 0;
+      lastReceiverUiUpdate = now;
+    }
   }
 };
 
@@ -269,7 +283,14 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
     const startTime = performance.now();
     let retryCount = 0;
     
-    const readSlice = (o: number, size: number) => {
+    let lastUiUpdate = performance.now();
+    let bytesAddedSinceLastUpdate = 0;
+    
+    dc.bufferedAmountLowThreshold = 1024 * 1024; // 1 MB
+    let isPaused = false;
+    let sending = false;
+    
+    const readSlice = (o: number, size: number): Promise<ArrayBuffer> => {
       return new Promise<ArrayBuffer>((res, rej) => {
         const reader = new FileReader();
         reader.onload = (e) => res(e.target?.result as ArrayBuffer);
@@ -278,7 +299,87 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       });
     };
 
-    const sendNextChunk = async () => {
+    const getAdaptiveChunkSize = (speed: number) => {
+      if (speed < 1 * 1024 * 1024) return 128 * 1024; // Slow: 128KB
+      if (speed < 5 * 1024 * 1024) return 256 * 1024; // Medium: 256KB
+      return 512 * 1024; // Fast: 512KB
+    };
+
+    let nextChunkPromise: Promise<ArrayBuffer> | null = null;
+    let currentChunkSize = 128 * 1024;
+    
+    const prefetchNextChunk = (o: number, size: number) => {
+      if (o < file.size) {
+        nextChunkPromise = readSlice(o, Math.min(size, file.size - o));
+      } else {
+        nextChunkPromise = null;
+      }
+    };
+
+    // Initial prefetch
+    prefetchNextChunk(offset, currentChunkSize);
+
+    const pump = async () => {
+      if (sending) return;
+      sending = true;
+
+      while (offset < file.size) {
+        if (dc.readyState !== 'open') {
+           resolve();
+           return;
+        }
+
+        if (dc.bufferedAmount > dc.bufferedAmountLowThreshold) {
+          isPaused = true;
+          sending = false;
+          return; // Wait for onbufferedamountlow
+        }
+
+        try {
+          if (!nextChunkPromise) prefetchNextChunk(offset, currentChunkSize);
+          const chunk = await nextChunkPromise!;
+          
+          dc.send(chunk);
+          offset += chunk.byteLength;
+          retryCount = 0;
+          bytesAddedSinceLastUpdate += chunk.byteLength;
+
+          const now = performance.now();
+          const elapsedSec = (now - startTime) / 1000;
+          const speed = elapsedSec > 0 ? offset / elapsedSec : 0;
+          
+          currentChunkSize = getAdaptiveChunkSize(speed);
+          prefetchNextChunk(offset, currentChunkSize); // Pipeline the next read
+
+          if (now - lastUiUpdate > 250 || offset >= file.size) {
+            useTransferStore.getState().updateReceiverState(socketId, bytesAddedSinceLastUpdate, speed);
+            bytesAddedSinceLastUpdate = 0;
+            lastUiUpdate = now;
+          }
+        } catch (e) {
+          console.error('Error sending chunk to', socketId, e);
+          if (retryCount < 5) {
+            retryCount++;
+            await new Promise(r => setTimeout(r, 1000));
+            nextChunkPromise = null; // force re-read
+          } else {
+            useTransferStore.getState().setReceiverStatus(socketId, 'failed');
+            const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
+            useTransferStore.getState().addHistoryRecord({
+              fileName: file.name,
+              size: file.size,
+              mode: 'send',
+              deviceName: receiverInfo?.name || 'Unknown Device',
+              date: Date.now(),
+              status: 'Failed',
+              duration: (performance.now() - startTime) / 1000
+            });
+            resolve();
+            return;
+          }
+        }
+      }
+
       if (offset >= file.size) {
         dc.send(JSON.stringify({ type: 'eof' }));
         useTransferStore.getState().setReceiverStatus(socketId, 'completed');
@@ -293,61 +394,20 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
           status: 'Completed',
           duration: (performance.now() - startTime) / 1000
         });
-        
         resolve();
-        return;
       }
-
-      // Check buffer
-      const buffered = dc.bufferedAmount || 0;
       
-      // SCTP max message size is technically ~256KB in modern browsers, but 64KB is the universally 
-      // guaranteed safe size across all WebRTC implementations to prevent 'max-message-size' errors.
-      let currentChunkSize = 64 * 1024; 
-      
+      sending = false;
+    };
 
-      
-      if (buffered > 8 * 1024 * 1024) {
-         // High congestion, back off temporarily
-         setTimeout(sendNextChunk, 50);
-         return;
-      }
-
-      try {
-        const chunk = await readSlice(offset, currentChunkSize);
-        dc.send(chunk);
-        offset += chunk.byteLength;
-        retryCount = 0; // reset on success
-        
-        const elapsed = (performance.now() - startTime) / 1000;
-        const speed = elapsed > 0 ? offset / elapsed : 0;
-        useTransferStore.getState().updateReceiverState(socketId, chunk.byteLength, speed);
-        
-        setTimeout(sendNextChunk, 0);
-      } catch (e) {
-        console.error('Error sending chunk to', socketId, e);
-        if (retryCount < 5) {
-          retryCount++;
-          console.log(`Retrying chunk for ${socketId} (Attempt ${retryCount})`);
-          setTimeout(sendNextChunk, 1000); // Retry after 1s
-        } else {
-          useTransferStore.getState().setReceiverStatus(socketId, 'failed');
-          const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-          useTransferStore.getState().addHistoryRecord({
-            fileName: file.name,
-            size: file.size,
-            mode: 'send',
-            deviceName: receiverInfo?.name || 'Unknown Device',
-            date: Date.now(),
-            status: 'Failed',
-            duration: (performance.now() - startTime) / 1000
-          });
-          resolve(); // Resolve to not block queue mode forever
-        }
+    dc.onbufferedamountlow = () => {
+      if (isPaused) {
+        isPaused = false;
+        pump();
       }
     };
 
-    sendNextChunk();
+    pump();
   });
 };
 
