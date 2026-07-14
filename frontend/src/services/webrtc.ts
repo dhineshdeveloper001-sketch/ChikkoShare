@@ -188,15 +188,23 @@ let fileMeta: any = null;
 let startTime = 0;
 let lastReceiverUiUpdate = 0;
 let receiverBytesAccumulated = 0;
+let receiverHashWorker: Worker | null = null;
 
 const handleIncomingData = (event: MessageEvent) => {
   if (typeof event.data === 'string') {
     try {
       const data = JSON.parse(event.data);
       if (data.type === 'metadata') {
+        if (!receiverHashWorker) {
+          receiverHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
+          receiverHashWorker.postMessage({ type: 'init' });
+        }
+        
         if (fileMeta && fileMeta.name === data.name && fileMeta.size === data.size && receivedSize > 0) {
           console.log(`Resuming file transfer from offset ${receivedSize}`);
         } else {
+          // New file or restart, reset everything
+          receiverHashWorker.postMessage({ type: 'init' });
           fileMeta = data;
           receiveBuffer = [];
           receivedSize = 0;
@@ -208,18 +216,35 @@ const handleIncomingData = (event: MessageEvent) => {
         }
         myDataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: receivedSize }));
       } else if (data.type === 'eof') {
-        // Final UI update
         const elapsedSec = (performance.now() - startTime) / 1000;
         const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
         useTransferStore.getState().updateMyState(receiverBytesAccumulated, speed);
         receiverBytesAccumulated = 0;
         
-        finishReceivingFile();
+        if (receiverHashWorker) {
+          receiverHashWorker.onmessage = (e) => {
+            if (e.data.type === 'result') {
+              const computedHash = e.data.hash;
+              if (computedHash !== data.hash || data.fileSize !== receivedSize) {
+                useTransferStore.getState().setMyStatus('failed'); // Set a generic failed or 'corrupted' status
+                toast.error('File corrupted during transfer! Hashes do not match.', { duration: 8000 });
+              } else {
+                finishReceivingFile();
+              }
+              receiverHashWorker?.terminate();
+              receiverHashWorker = null;
+            }
+          };
+          receiverHashWorker.postMessage({ type: 'finish' });
+        } else {
+          finishReceivingFile();
+        }
       }
     } catch(e) {}
   } else {
     const chunk = event.data as ArrayBuffer;
     receiveBuffer.push(chunk);
+    receiverHashWorker?.postMessage({ type: 'update', chunk });
     receivedSize += chunk.byteLength;
     receiverBytesAccumulated += chunk.byteLength;
     
@@ -312,6 +337,9 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
     dc.addEventListener('message', onMessage);
 
     const startPumping = (initialOffset: number) => {
+      const senderHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
+      senderHashWorker.postMessage({ type: 'init' });
+      
       let offset = initialOffset;
       const startTime = performance.now();
       let retryCount = 0;
@@ -373,6 +401,7 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
           const chunk = await nextChunkPromise!;
           
           dc.send(chunk);
+          senderHashWorker.postMessage({ type: 'update', chunk });
           offset += chunk.byteLength;
           retryCount = 0;
           bytesAddedSinceLastUpdate += chunk.byteLength;
@@ -414,20 +443,34 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       }
 
       if (offset >= file.size) {
-        dc.send(JSON.stringify({ type: 'eof' }));
-        useTransferStore.getState().setReceiverStatus(socketId, 'completed');
-        
-        const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-        useTransferStore.getState().addHistoryRecord({
-          fileName: file.name,
-          size: file.size,
-          mode: 'send',
-          deviceName: receiverInfo?.name || 'Unknown Device',
-          date: Date.now(),
-          status: 'Completed',
-          duration: (performance.now() - startTime) / 1000
-        });
-        resolve();
+        senderHashWorker.onmessage = (e) => {
+          if (e.data.type === 'result') {
+            dc.send(JSON.stringify({ 
+              type: 'eof', 
+              hash: e.data.hash,
+              totalChunks: e.data.chunkCount,
+              fileSize: file.size,
+              transferTime: performance.now() - startTime
+            }));
+            
+            useTransferStore.getState().setReceiverStatus(socketId, 'completed');
+            
+            const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
+            useTransferStore.getState().addHistoryRecord({
+              fileName: file.name,
+              size: file.size,
+              mode: 'send',
+              deviceName: receiverInfo?.name || 'Unknown Device',
+              date: Date.now(),
+              status: 'Completed',
+              duration: (performance.now() - startTime) / 1000
+            });
+            senderHashWorker.terminate();
+            resolve();
+          }
+        };
+        senderHashWorker.postMessage({ type: 'finish' });
+        return;
       }
       
       sending = false;
