@@ -13,6 +13,16 @@ export interface RoomData {
   createdAt: number;
   transferMode: TransferMode;
   maxReceivers: number;
+  senderName: string;
+  fileCount: number;
+  totalSize: number;
+}
+
+export interface RoomMetadata {
+  senderName: string;
+  transferMode: TransferMode;
+  fileCount: number;
+  totalSize: number;
 }
 
 export interface JoinRoomRequest {
@@ -49,7 +59,8 @@ export interface ServerToClientEvents {
 }
 
 export interface ClientToServerEvents {
-  create_room: (data: { transferMode: TransferMode, maxReceivers: number }) => void;
+  create_room: (data: { transferMode: TransferMode, maxReceivers: number, senderName: string, fileCount: number, totalSize: number }) => void;
+  get_room_metadata: (data: { roomId: string, token: string }, callback: (res: { error?: string, metadata?: RoomMetadata }) => void) => void;
   request_join: (data: JoinRoomRequest) => void; // Receiver asks to join
   approve_request: (data: { roomId: string, receiverSocketId: string }) => void; // Sender approves
   reject_request: (data: { roomId: string, receiverSocketId: string, reason: string }) => void; // Sender rejects

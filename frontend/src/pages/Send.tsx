@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import QRCode from 'react-qr-code';
 import { motion } from 'framer-motion';
 import { FiUploadCloud, FiCheck, FiX, FiActivity, FiSettings, FiTrash2 } from 'react-icons/fi';
+import toast from 'react-hot-toast';
 import { socket, connectSocket } from '../services/socket';
 import { startTransferToAll, removePeer } from '../services/webrtc';
 import { useRoomStore } from '../store/roomStore';
@@ -24,7 +25,22 @@ const Send: React.FC = () => {
   }, []);
 
   const handleCreateRoom = () => {
-    socket.emit('create_room', { transferMode: selectedMode, maxReceivers });
+    if (selectedFiles.length === 0) return toast.error('Please select at least one file to send.');
+    
+    // Generate a sender name if not existing
+    let senderName = localStorage.getItem('chikko_device_name');
+    if (!senderName) {
+      senderName = `Sender-${Math.floor(Math.random() * 10000)}`;
+      localStorage.setItem('chikko_device_name', senderName);
+    }
+    
+    socket.emit('create_room', { 
+      transferMode: selectedMode, 
+      maxReceivers,
+      senderName,
+      fileCount: selectedFiles.length,
+      totalSize: totalBytes
+    });
     setRoomCreated(true);
   };
 
@@ -66,7 +82,12 @@ const Send: React.FC = () => {
     useRoomStore.getState().removeConnectedReceiver(socketId);
   };
 
-  const qrData = roomData ? JSON.stringify({ roomId: roomData.roomId, token: roomData.token }) : '';
+  const qrData = roomData ? JSON.stringify({ 
+    roomId: roomData.roomId, 
+    token: roomData.token,
+    version: 1,
+    timestamp: Date.now()
+  }) : '';
 
   // Calculate aggregates
   let aggBytes = 0;
@@ -85,10 +106,32 @@ const Send: React.FC = () => {
     <div className="flex flex-col items-center py-8">
       {!roomCreated ? (
         <motion.div className="glass-panel w-full max-w-xl p-8" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-          <h2 className="text-3xl font-bold mb-6 flex items-center gap-3"><FiSettings className="text-blue-400"/> Session Setup</h2>
+          <h2 className="text-3xl font-bold mb-6 flex items-center gap-3"><FiSettings className="text-blue-400"/> Configure Transfer</h2>
           
+          <div className="mb-8">
+            <label className="block text-slate-300 font-medium mb-3">1. Select Files</label>
+            <div 
+              className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl cursor-pointer p-6 text-center transition-colors
+                ${dragActive ? 'border-blue-500 bg-blue-500/10' : 'border-slate-600 hover:border-slate-500 hover:bg-slate-800/50'}
+              `}
+              onDragEnter={(e) => { e.preventDefault(); setDragActive(true); }}
+              onDragLeave={() => setDragActive(false)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); setDragActive(false); if (e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files)); }}
+              onClick={() => document.getElementById('file-upload-init')?.click()}
+            >
+              <input id="file-upload-init" type="file" multiple className="hidden" onChange={(e) => e.target.files && handleFiles(Array.from(e.target.files))} />
+              <FiUploadCloud className="text-4xl text-slate-400 mb-2" />
+              {selectedFiles.length > 0 ? (
+                <div className="text-blue-400 font-bold">{selectedFiles.length} file(s) selected ({formatSize(totalBytes)})</div>
+              ) : (
+                <p className="text-slate-300">Click or drag files here</p>
+              )}
+            </div>
+          </div>
+
           <div className="mb-6">
-            <label className="block text-slate-300 font-medium mb-2">Transfer Mode</label>
+            <label className="block text-slate-300 font-medium mb-2">2. Transfer Mode</label>
             <div className="grid grid-cols-3 gap-3">
               {(['private', 'broadcast', 'queue'] as TransferMode[]).map(mode => (
                 <button
@@ -111,7 +154,7 @@ const Send: React.FC = () => {
           </div>
 
           <div className="mb-8">
-            <label className="block text-slate-300 font-medium mb-2">Max Receivers</label>
+            <label className="block text-slate-300 font-medium mb-2">3. Max Receivers</label>
             <select 
               value={maxReceivers} 
               onChange={(e) => setMaxReceivers(Number(e.target.value))}
@@ -181,34 +224,19 @@ const Send: React.FC = () => {
             {/* File Selection / Overall Progress */}
             <motion.div className="glass-panel p-6">
                {senderStatus === 'idle' ? (
-                 <div className="flex flex-col">
-                   <div 
-                      className={`flex flex-col items-center justify-center border-2 border-dashed rounded-2xl cursor-pointer p-8 text-center transition-colors
-                        ${dragActive ? 'border-blue-500 bg-blue-500/10' : 'border-slate-600 hover:border-slate-500 hover:bg-slate-800/50'}
-                      `}
-                      onDragEnter={(e) => { e.preventDefault(); setDragActive(true); }}
-                      onDragLeave={() => setDragActive(false)}
-                      onDragOver={(e) => e.preventDefault()}
-                      onDrop={(e) => { e.preventDefault(); setDragActive(false); if (e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files)); }}
-                      onClick={() => document.getElementById('file-upload')?.click()}
-                    >
-                      <input id="file-upload" type="file" className="hidden" onChange={(e) => e.target.files && handleFiles(Array.from(e.target.files))} />
-                      <FiUploadCloud className="text-4xl text-slate-400 mb-3" />
-                      <p className="text-lg font-medium mb-1">Select File to Send</p>
-                    </div>
-
+                 <div className="flex flex-col h-full justify-center">
                     {files.length > 0 && (
-                      <div className="mt-6 flex items-center justify-between bg-slate-900/50 p-4 rounded-xl border border-slate-700">
-                        <div>
-                          <div className="font-bold">{files[0].name}</div>
-                          <div className="text-sm text-slate-400">{formatSize(files[0].size)}</div>
+                      <div className="flex flex-col items-center justify-center bg-slate-900/50 p-8 rounded-xl border border-slate-700 h-full">
+                        <div className="text-center mb-6">
+                          <div className="text-xl font-bold text-slate-200 mb-2">{files.length} File(s) Ready to Send</div>
+                          <div className="text-slate-400">{formatSize(totalBytes)} total</div>
                         </div>
                         <button 
                           onClick={startTransfer}
                           disabled={connectedReceivers.size === 0}
-                          className="px-6 py-3 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 text-white font-bold rounded-xl transition-colors"
+                          className="w-full max-w-sm px-6 py-4 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 text-white font-bold rounded-xl transition-colors shadow-lg shadow-blue-500/20"
                         >
-                          Send to {connectedReceivers.size} Receivers
+                          Start Sending to {connectedReceivers.size} Receiver(s)
                         </button>
                       </div>
                     )}

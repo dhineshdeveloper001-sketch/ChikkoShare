@@ -51,6 +51,9 @@ interface RoomState {
   createdAt: number;
   transferMode: TransferMode;
   maxReceivers: number;
+  senderName: string;
+  fileCount: number;
+  totalSize: number;
   senderSocketId: string;
   approvedReceivers: Map<string, DeviceInfo>; // socketId -> DeviceInfo
   pendingRequests: Map<string, DeviceInfo>; // socketId -> DeviceInfo
@@ -83,6 +86,9 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       createdAt: Date.now(),
       transferMode: data.transferMode || 'private',
       maxReceivers: data.maxReceivers || 1,
+      senderName: data.senderName || 'Sender',
+      fileCount: data.fileCount || 0,
+      totalSize: data.totalSize || 0,
       senderSocketId: socket.id,
       approvedReceivers: new Map(),
       pendingRequests: new Map(),
@@ -100,6 +106,28 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
       maxReceivers: roomData.maxReceivers,
     });
     console.log(`Room created: ${formattedRoomId} by ${socket.id} (Mode: ${roomData.transferMode})`);
+  });
+
+  socket.on('get_room_metadata', (data, callback) => {
+    const room = rooms.get(data.roomId);
+    if (!room) {
+      callback({ error: 'Room not found or expired.' });
+      return;
+    }
+    
+    if (room.token !== data.token) {
+      callback({ error: 'Invalid token.' });
+      return;
+    }
+    
+    callback({
+      metadata: {
+        senderName: room.senderName,
+        transferMode: room.transferMode,
+        fileCount: room.fileCount,
+        totalSize: room.totalSize
+      }
+    });
   });
 
   socket.on('request_join', (data: JoinRoomRequest) => {
