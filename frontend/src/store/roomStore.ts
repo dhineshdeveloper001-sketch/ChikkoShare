@@ -1,93 +1,46 @@
 import { create } from 'zustand';
-import type { RoomData, PendingRequest, DeviceInfo } from '../../../shared/types';
 import { persist, createJSONStorage } from 'zustand/middleware';
+import type { NetworkMode } from '../../../shared/types';
 
 interface RoomState {
-  roomData: RoomData | null;
-  isConnectedToSignaling: boolean;
-  
-  // Sender specific
-  pendingRequests: PendingRequest[];
-  connectedReceivers: Map<string, DeviceInfo>; // socketId -> DeviceInfo
-  
-  // Receiver specific
-  isWaitingForApproval: boolean;
-  approvalRejectedReason: string | null;
-  myDeviceInfo: DeviceInfo | null;
-  senderDisconnected: boolean;
-  
-  setRoomData: (data: RoomData | null) => void;
-  setSignalingConnection: (isConnected: boolean) => void;
-  
-  addPendingRequest: (req: PendingRequest) => void;
-  removePendingRequest: (socketId: string) => void;
-  addConnectedReceiver: (socketId: string, deviceInfo: DeviceInfo) => void;
-  removeConnectedReceiver: (socketId: string) => void;
-  
-  setWaitingForApproval: (isWaiting: boolean) => void;
-  setApprovalRejected: (reason: string | null) => void;
-  setMyDeviceInfo: (info: DeviceInfo) => void;
-  setSenderDisconnected: (disconnected: boolean) => void;
-  
+  roomId: string | null;
+  token: string | null;
+  isSignalingConnected: boolean;
+  peerConnected: boolean;
+  networkMode: NetworkMode;
+
+  setRoom: (roomId: string, token: string) => void;
+  setSignalingConnected: (v: boolean) => void;
+  setPeerConnected: (v: boolean) => void;
+  setNetworkMode: (mode: NetworkMode) => void;
   reset: () => void;
 }
 
 export const useRoomStore = create<RoomState>()(
   persist(
     (set) => ({
-  roomData: null,
-  isConnectedToSignaling: false,
-  
-  pendingRequests: [],
-  connectedReceivers: new Map(),
-  
-  isWaitingForApproval: false,
-  approvalRejectedReason: null,
-  myDeviceInfo: null,
-  senderDisconnected: false,
+      roomId: null,
+      token: null,
+      isSignalingConnected: false,
+      peerConnected: false,
+      networkMode: 'detecting',
 
-  setRoomData: (data) => set({ roomData: data }),
-  setSignalingConnection: (isConnectedToSignaling) => set({ isConnectedToSignaling }),
-  
-  addPendingRequest: (req) => set((state) => {
-    // Avoid duplicates
-    if (!state.pendingRequests.find(r => r.socketId === req.socketId)) {
-      return { pendingRequests: [...state.pendingRequests, req] };
+      setRoom: (roomId, token) => set({ roomId, token }),
+      setSignalingConnected: (isSignalingConnected) => set({ isSignalingConnected }),
+      setPeerConnected: (peerConnected) => set({ peerConnected }),
+      setNetworkMode: (networkMode) => set({ networkMode }),
+
+      reset: () => set({
+        roomId: null,
+        token: null,
+        peerConnected: false,
+        networkMode: 'detecting',
+      }),
+    }),
+    {
+      name: 'chikko-room-v3',
+      storage: createJSONStorage(() => sessionStorage),
+      partialize: (state) => ({ roomId: state.roomId, token: state.token }),
     }
-    return state;
-  }),
-  removePendingRequest: (socketId) => set((state) => ({
-    pendingRequests: state.pendingRequests.filter(r => r.socketId !== socketId)
-  })),
-  
-  addConnectedReceiver: (socketId, deviceInfo) => set((state) => {
-    const newMap = new Map(state.connectedReceivers);
-    newMap.set(socketId, deviceInfo);
-    return { connectedReceivers: newMap };
-  }),
-  removeConnectedReceiver: (socketId) => set((state) => {
-    const newMap = new Map(state.connectedReceivers);
-    newMap.delete(socketId);
-    return { connectedReceivers: newMap };
-  }),
-
-  setWaitingForApproval: (isWaiting) => set({ isWaitingForApproval: isWaiting }),
-  setApprovalRejected: (reason) => set({ approvalRejectedReason: reason }),
-  setMyDeviceInfo: (info) => set({ myDeviceInfo: info }),
-  setSenderDisconnected: (disconnected) => set({ senderDisconnected: disconnected }),
-  
-  reset: () => set({ 
-    roomData: null, 
-    pendingRequests: [],
-    connectedReceivers: new Map(),
-    isWaitingForApproval: false,
-    approvalRejectedReason: null,
-    senderDisconnected: false,
-  })
-  }),
-  {
-    name: 'chikko-room-session',
-    storage: createJSONStorage(() => sessionStorage),
-    partialize: (state) => ({ roomData: state.roomData }), // Only persist roomData to session storage
-  }
-));
+  )
+);

@@ -1,7 +1,10 @@
 import { socket } from './socket';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
+import { detectNetworkMode } from './networkDetector';
+import { uploadFileToCloud } from './cloudTransfer';
 import toast from 'react-hot-toast';
+import type { FileEntry } from '../../../shared/types';
 
 const STUN_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -9,518 +12,421 @@ const STUN_SERVERS = [
   { urls: 'stun:stun2.l.google.com:19302' },
 ];
 
-// ─── State Machine ────────────────────────────────────────────────────────────
-export type PeerState =
-  | 'DISCONNECTED'
-  | 'CONNECTING'
-  | 'PEER_CONNECTED'
-  | 'DATACHANNEL_OPEN'
-  | 'READY_FOR_TRANSFER'
-  | 'TRANSFERRING'
-  | 'COMPLETED'
-  | 'FAILED';
+// ── Single peer connection (v3 is always 1-to-1) ──────────────────────────────
+let peerConnection: RTCPeerConnection | null = null;
+let dataChannel: RTCDataChannel | null = null;
+let peerRole: 'sender' | 'receiver' | null = null;
 
-interface PeerInstance {
-  pc: RTCPeerConnection;
-  dc: RTCDataChannel | null;
-  state: PeerState;
-}
+// Pause/cancel signals
+let _isPaused = false;
+let _isCancelled = false;
 
-// Maps receiverSocketId → PeerInstance (Sender side)
-const peers = new Map<string, PeerInstance>();
+export const pauseWebRTC  = () => { _isPaused   = true;  };
+export const resumeWebRTC = () => { _isPaused   = false; };
+export const cancelWebRTC = () => { _isCancelled = true; closeWebRTC(); };
 
-// Receiver side
-let myPeerConnection: RTCPeerConnection | null = null;
-let myDataChannel: RTCDataChannel | null = null;
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-export const clearPeers = () => {
-  peers.forEach(p => { try { p.dc?.close(); p.pc.close(); } catch (_) {} });
-  peers.clear();
-};
-
-export const removePeer = (socketId: string) => {
-  const peer = peers.get(socketId);
-  if (peer) {
-    try { peer.dc?.close(); peer.pc.close(); } catch (_) {}
-    peers.delete(socketId);
-  }
-};
-
+// ── Cleanup ───────────────────────────────────────────────────────────────────
 export const closeWebRTC = () => {
-  clearPeers();
-  try { myDataChannel?.close(); myPeerConnection?.close(); } catch (_) {}
-  myPeerConnection = null;
-  myDataChannel = null;
+  try { dataChannel?.close(); } catch (_) {}
+  try { peerConnection?.close(); } catch (_) {}
+  peerConnection = null;
+  dataChannel    = null;
+  _isPaused      = false;
+  _isCancelled   = false;
 };
 
-const getBrowserMaxChunk = (socketId: string): number => {
-  const receiver = useRoomStore.getState().connectedReceivers.get(socketId);
-  const browser = (receiver?.browser || '').toLowerCase();
-  if (browser.includes('safari')) return 64 * 1024;
-  if (browser.includes('firefox')) return 128 * 1024;
-  return 256 * 1024; // Chrome / Edge / default
+// ── Browser-specific chunk sizes ───────────────────────────────────────────────
+const getMaxChunk = (): number => {
+  const ua = navigator.userAgent.toLowerCase();
+  if (ua.includes('safari') && !ua.includes('chrome')) return 64 * 1024;
+  if (ua.includes('firefox')) return 128 * 1024;
+  return 256 * 1024;
 };
 
-// ─── SENDER: Initiate WebRTC ──────────────────────────────────────────────────
-export const initiateWebRTCConnection = async (receiverSocketId: string) => {
-  console.log(`[SOCKET] RECEIVER JOINED → initiating WebRTC for ${receiverSocketId}`);
+// ─────────────────────────────────────────────────────────────────────────────
+// SENDER: Initiate connection & detect network mode
+// Called as soon as receiver joins the room.
+// ─────────────────────────────────────────────────────────────────────────────
+export const initiateSenderConnection = async (receiverSocketId: string): Promise<void> => {
+  peerRole = 'sender';
+  closeWebRTC();
+  _isCancelled = false;
+
+  const roomId = useRoomStore.getState().roomId;
+  if (!roomId) return;
+
+  peerConnection = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+
+  // Start network detection on this peer connection BEFORE any ICE happens
+  detectNetworkMode(peerConnection).then((mode) => {
+    console.log('[WEBRTC] detectNetworkMode resolved:', mode);
+    useRoomStore.getState().setNetworkMode(mode);
+    useTransferStore.getState().setNetworkMode(mode);
+    socket.emit('report_network_mode', { roomId, mode });
+
+    if (mode === 'cloud') {
+      // WebRTC didn't work — switch to cloud path
+      startCloudUpload();
+    }
+    // If mode === 'local', WebRTC DataChannel handles the transfer (see dc.onopen below)
+  });
+
+  peerConnection.onicecandidate = (e) => {
+    if (e.candidate) {
+      socket.emit('signaling_message', {
+        roomId, targetSocketId: receiverSocketId,
+        type: 'ice-candidate', payload: e.candidate,
+      });
+    }
+  };
+
+  peerConnection.onconnectionstatechange = () => {
+    console.log('[WEBRTC] Connection state:', peerConnection?.connectionState);
+    if (peerConnection?.connectionState === 'failed') {
+      console.warn('[WEBRTC] Connection failed! Falling back to cloud.');
+      if (useRoomStore.getState().networkMode !== 'cloud') {
+        useRoomStore.getState().setNetworkMode('cloud');
+        useTransferStore.getState().setNetworkMode('cloud');
+        socket.emit('report_network_mode', { roomId, mode: 'cloud' });
+        startCloudUpload();
+      }
+    }
+  };
+
+  // Create data channel
+  dataChannel = peerConnection.createDataChannel('chikko', { ordered: true });
+  dataChannel.binaryType = 'arraybuffer';
+
+  dataChannel.onopen = () => {
+    console.log('[WEBRTC] DataChannel onopen fired!');
+    useRoomStore.getState().setNetworkMode('local');
+    useTransferStore.getState().setNetworkMode('local');
+    socket.emit('report_network_mode', { roomId, mode: 'local' });
+    startWebRTCTransfer();
+  };
+
+  dataChannel.onerror = (e) => {
+    if (import.meta.env.DEV) console.error('[WEBRTC] DC error:', e);
+  };
+
+  const offer = await peerConnection.createOffer();
+  await peerConnection.setLocalDescription(offer);
+  socket.emit('signaling_message', {
+    roomId, targetSocketId: receiverSocketId, type: 'offer', payload: offer,
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RECEIVER: Set up to receive offer
+// ─────────────────────────────────────────────────────────────────────────────
+export const setupReceiverConnection = async (senderSocketId: string): Promise<void> => {
+  peerRole = 'receiver';
+  closeWebRTC();
+  _isCancelled = false;
+
+  const roomId = useRoomStore.getState().roomId;
+  if (!roomId) return;
+
+  peerConnection = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+
+  peerConnection.onicecandidate = (e) => {
+    if (e.candidate) {
+      socket.emit('signaling_message', {
+        roomId, targetSocketId: senderSocketId,
+        type: 'ice-candidate', payload: e.candidate,
+      });
+    }
+  };
+
+  peerConnection.ondatachannel = (e) => {
+    dataChannel = e.channel;
+    dataChannel.binaryType = 'arraybuffer';
+    dataChannel.onopen    = () => {};
+    dataChannel.onmessage = handleIncomingData;
+    dataChannel.onerror   = (err) => {
+      if (import.meta.env.DEV) console.error('[WEBRTC] DC error:', err);
+    };
+  };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signaling router (handles offer/answer/ice-candidate)
+// ─────────────────────────────────────────────────────────────────────────────
+export const handleSignalingMessage = async (msg: any): Promise<void> => {
   try {
-    const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
-    peers.set(receiverSocketId, { pc, dc: null, state: 'CONNECTING' });
-    useTransferStore.getState().initReceiverState(receiverSocketId);
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        const roomId = useRoomStore.getState().roomData?.roomId;
-        if (roomId) {
-          socket.emit('signaling_message', {
-            roomId,
-            targetSocketId: receiverSocketId,
-            type: 'ice-candidate',
-            payload: event.candidate,
-          });
-        }
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      console.log(`[WEBRTC] ICE STATE [${receiverSocketId}]: ${state}`);
-      const peer = peers.get(receiverSocketId);
-      if (!peer) return;
-
-      if (state === 'connected') {
-        peer.state = 'PEER_CONNECTED';
-        console.log(`[WEBRTC] ICE CONNECTED for ${receiverSocketId}`);
-      } else if (state === 'disconnected' || state === 'failed') {
-        peer.state = 'FAILED';
-        useTransferStore.getState().setReceiverStatus(receiverSocketId, 'failed');
-        toast.error('Connection lost with receiver.');
-      }
-    };
-
-    const dc = pc.createDataChannel('fileTransfer', { ordered: true });
-    peers.get(receiverSocketId)!.dc = dc;
-    dc.binaryType = 'arraybuffer';
-
-    dc.onopen = () => {
-      console.log(`[WEBRTC] DATACHANNEL OPEN for ${receiverSocketId}`);
-      const peer = peers.get(receiverSocketId);
-      if (!peer) return;
-      peer.state = 'DATACHANNEL_OPEN';
-      useTransferStore.getState().setReceiverStatus(receiverSocketId, 'connected');
-      console.log(`[TRANSFER] READY for ${receiverSocketId}`);
-
-      // ── AUTO-START: Trigger transfer from inside the DataChannel open event ──
-      // This is the ONLY place transfer is triggered — no React useEffect needed.
-      const { files: fileMetas } = useTransferStore.getState();
-      const rawFiles: File[] = (window as any).__chikkoFiles || [];
-
-      if (rawFiles.length > 0) {
-        peer.state = 'TRANSFERRING';
-        console.log(`[TRANSFER] START → ${rawFiles[0].name} to ${receiverSocketId}`);
-        useTransferStore.getState().setSenderStatus('transferring');
-        useTransferStore.getState().setReceiverStatus(receiverSocketId, 'transferring');
-        sendFileToPeer(rawFiles[0], receiverSocketId, dc);
-      } else {
-        console.warn(`[TRANSFER] DC open but no File objects available. Files:`, fileMetas.length);
-      }
-    };
-
-    dc.onclose = () => console.log(`[WEBRTC] DATACHANNEL CLOSED for ${receiverSocketId}`);
-    dc.onerror = (e) => console.error(`[WEBRTC] DATACHANNEL ERROR for ${receiverSocketId}`, e);
-
-    console.log(`[WEBRTC] OFFER CREATED for ${receiverSocketId}`);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    const roomId = useRoomStore.getState().roomData?.roomId;
-    if (roomId) {
-      socket.emit('signaling_message', { roomId, targetSocketId: receiverSocketId, type: 'offer', payload: offer });
-    }
-  } catch (err) {
-    console.error('[WEBRTC] Error initiating connection:', err);
-    toast.error('Failed to establish P2P connection.');
-  }
-};
-
-// ─── RECEIVER: Setup WebRTC ───────────────────────────────────────────────────
-export const setupReceiverWebRTC = async (senderSocketId: string) => {
-  myPeerConnection = new RTCPeerConnection({ iceServers: STUN_SERVERS });
-
-  myPeerConnection.onicecandidate = (event) => {
-    if (event.candidate) {
-      const roomId = useRoomStore.getState().roomData?.roomId;
-      if (roomId) {
-        socket.emit('signaling_message', {
-          roomId,
-          targetSocketId: senderSocketId,
-          type: 'ice-candidate',
-          payload: event.candidate,
-        });
-      }
-    }
-  };
-
-  myPeerConnection.onconnectionstatechange = () => {
-    const state = myPeerConnection?.connectionState;
-    console.log(`[WEBRTC] RECEIVER ICE STATE: ${state}`);
-    if (state === 'connected') {
-      useTransferStore.getState().setMyStatus('connected');
-    } else if (state === 'disconnected' || state === 'failed') {
-      useTransferStore.getState().setMyStatus('failed');
-      toast.error('Connection lost with sender.');
-    }
-  };
-
-  myPeerConnection.ondatachannel = (event) => {
-    myDataChannel = event.channel;
-    myDataChannel.binaryType = 'arraybuffer';
-    myDataChannel.onopen = () => {
-      console.log('[WEBRTC] DATACHANNEL OPEN (Receiver)');
-      useTransferStore.getState().setMyStatus('connected');
-    };
-    myDataChannel.onmessage = handleIncomingData;
-    myDataChannel.onerror = (e) => console.error('[WEBRTC] RECEIVER DATACHANNEL ERROR', e);
-  };
-};
-
-// ─── Signaling Router ─────────────────────────────────────────────────────────
-export const handleSignalingMessage = async (msg: any) => {
-  const isSender = useTransferStore.getState().role === 'sender';
-  try {
-    if (isSender) {
-      const peer = peers.get(msg.senderSocketId);
-      if (!peer) return;
+    if (peerRole === 'sender') {
+      if (!peerConnection) return;
       if (msg.type === 'answer') {
-        console.log(`[WEBRTC] ANSWER RECEIVED from ${msg.senderSocketId}`);
-        await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(msg.payload));
       } else if (msg.type === 'ice-candidate') {
-        await peer.pc.addIceCandidate(new RTCIceCandidate(msg.payload));
+        await peerConnection.addIceCandidate(new RTCIceCandidate(msg.payload));
       }
     } else {
-      if (!myPeerConnection) await setupReceiverWebRTC(msg.senderSocketId);
+      // Receiver
+      if (!peerConnection) await setupReceiverConnection(msg.senderSocketId);
       if (msg.type === 'offer') {
-        await myPeerConnection?.setRemoteDescription(new RTCSessionDescription(msg.payload));
-        const answer = await myPeerConnection?.createAnswer();
-        await myPeerConnection?.setLocalDescription(answer);
-        socket.emit('signaling_message', { roomId: msg.roomId, targetSocketId: msg.senderSocketId, type: 'answer', payload: answer });
+        await peerConnection!.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        const answer = await peerConnection!.createAnswer();
+        await peerConnection!.setLocalDescription(answer);
+        const roomId = useRoomStore.getState().roomId!;
+        socket.emit('signaling_message', {
+          roomId, targetSocketId: msg.senderSocketId, type: 'answer', payload: answer,
+        });
       } else if (msg.type === 'ice-candidate') {
-        await myPeerConnection?.addIceCandidate(new RTCIceCandidate(msg.payload));
+        await peerConnection!.addIceCandidate(new RTCIceCandidate(msg.payload));
       }
     }
   } catch (err) {
-    console.error('[WEBRTC] Signaling error:', err);
+      if (import.meta.env.DEV) console.error('[WEBRTC] Signaling error:', err);
   }
 };
 
-// ─── RECEIVER: Incoming Data Handler ─────────────────────────────────────────
-let receiveBuffer: ArrayBuffer[] = [];
-let receivedSize = 0;
-let fileMeta: any = null;
-let rxStartTime = 0;
-let lastRxUiUpdate = 0;
-let rxBytesAccum = 0;
-let receiverHashWorker: Worker | null = null;
+// ─────────────────────────────────────────────────────────────────────────────
+// SENDER: WebRTC file pump (multi-file)
+// ─────────────────────────────────────────────────────────────────────────────
+async function startWebRTCTransfer(): Promise<void> {
+  const rawFiles: File[] = (window as any).__chikkoFiles ?? [];
+  const fileEntries = useTransferStore.getState().files;
+  if (rawFiles.length === 0) return;
 
-const handleIncomingData = (event: MessageEvent) => {
-  if (typeof event.data === 'string') {
-    try {
-      const data = JSON.parse(event.data);
-      if (data.type === 'metadata') {
-        console.log(`[WEBRTC] METADATA RECEIVED: ${data.name} (${data.size} bytes)`);
-        if (!receiverHashWorker) {
-          receiverHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
-          receiverHashWorker.postMessage({ type: 'init' });
-        }
-        if (fileMeta && fileMeta.name === data.name && fileMeta.size === data.size && receivedSize > 0) {
-          console.log(`[WEBRTC] RESUMING from offset ${receivedSize}`);
-        } else {
-          receiverHashWorker.postMessage({ type: 'init' });
-          fileMeta = data;
-          receiveBuffer = [];
-          receivedSize = 0;
-          rxBytesAccum = 0;
-          rxStartTime = performance.now();
-          lastRxUiUpdate = rxStartTime;
-          useTransferStore.getState().setMyStatus('transferring');
-          useTransferStore.getState().setFiles([{ name: fileMeta.name, size: fileMeta.size, type: fileMeta.fileType }]);
-        }
-        console.log(`[WEBRTC] SYNC_OFFSET SEND: ${receivedSize}`);
-        myDataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: receivedSize }));
-      } else if (data.type === 'eof') {
-        const elapsedSec = (performance.now() - rxStartTime) / 1000;
-        const speed = elapsedSec > 0 ? receivedSize / elapsedSec : 0;
-        useTransferStore.getState().updateMyState(rxBytesAccum, speed);
-        rxBytesAccum = 0;
-        if (receiverHashWorker) {
-          receiverHashWorker.onmessage = (e) => {
-            if (e.data.type === 'result') {
-              if (e.data.hash !== data.hash || data.fileSize !== receivedSize) {
-                useTransferStore.getState().setMyStatus('failed');
-                toast.error('File corrupted! Hash mismatch.', { duration: 8000 });
-              } else {
-                finishReceivingFile();
-              }
-              receiverHashWorker?.terminate();
-              receiverHashWorker = null;
-            }
-          };
-          receiverHashWorker.postMessage({ type: 'finish' });
-        } else {
-          finishReceivingFile();
-        }
-      }
-    } catch (e) {
-      console.error('[WEBRTC] Error processing incoming message:', e);
-    }
-  } else {
-    const chunk = event.data as ArrayBuffer;
-    if (receivedSize === 0) console.log(`[CHUNK] RECEIVE 0`);
-    receiveBuffer.push(chunk);
-    receiverHashWorker?.postMessage({ type: 'update', chunk });
-    receivedSize += chunk.byteLength;
-    rxBytesAccum += chunk.byteLength;
-    const now = performance.now();
-    if (now - lastRxUiUpdate > 250) {
-      const speed = (performance.now() - rxStartTime) > 0 ? receivedSize / ((performance.now() - rxStartTime) / 1000) : 0;
-      useTransferStore.getState().updateMyState(rxBytesAccum, speed);
-      rxBytesAccum = 0;
-      lastRxUiUpdate = now;
-    }
+  useTransferStore.getState().setOverallStatus('transferring');
+
+  for (let i = 0; i < rawFiles.length; i++) {
+    if (_isCancelled) break;
+    const file  = rawFiles[i];
+    const entry = fileEntries[i];
+    if (!file || !entry || !dataChannel) continue;
+
+    useTransferStore.getState().setFileStatus(i, 'transferring');
+    await sendFileToPeer(file, entry, i, dataChannel);
   }
-};
 
-const finishReceivingFile = async () => {
-  useTransferStore.getState().setMyStatus('completed');
-  const blob = new Blob(receiveBuffer, { type: fileMeta.fileType || 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = fileMeta.name;
-  a.click();
-  URL.revokeObjectURL(url);
-  toast.success(`Downloaded: ${fileMeta.name}`);
-  useTransferStore.getState().addHistoryRecord({
-    fileName: fileMeta.name,
-    size: fileMeta.size,
-    mode: 'receive',
-    deviceName: 'Sender',
-    date: Date.now(),
-    status: 'Completed',
-    duration: (performance.now() - rxStartTime) / 1000,
-  });
-  receiveBuffer = [];
-};
+  if (!_isCancelled) {
+    useTransferStore.getState().setOverallStatus('completed');
+  }
+}
 
-// ─── SENDER: File Pump ────────────────────────────────────────────────────────
-export const startTransferToAll = async (file: File) => {
-  const mode = useRoomStore.getState().roomData?.transferMode;
-  const activePeers = Array.from(peers.entries()).filter(([_, p]) => p.dc?.readyState === 'open');
-  console.log(`[TRANSFER] startTransferToAll: file=${file.name}, activePeers=${activePeers.length}, peersTotal=${peers.size}`);
-  peers.forEach((p, id) => console.log(`  peer ${id}: dcState=${p.dc?.readyState ?? 'null'}, peerState=${p.state}`));
-
-  if (activePeers.length === 0) {
-    console.error('[TRANSFER] No open DataChannels. Cannot start.');
-    useTransferStore.getState().setSenderStatus('failed');
-    toast.error('Connection not ready. Please wait.');
+// ─────────────────────────────────────────────────────────────────────────────
+// SENDER: Cloud upload (multi-file, sequential)
+// ─────────────────────────────────────────────────────────────────────────────
+async function startCloudUpload(): Promise<void> {
+  console.log('[CLOUD] startCloudUpload called');
+  const rawFiles: File[] = (window as any).__chikkoFiles ?? [];
+  const fileEntries = useTransferStore.getState().files;
+  const roomId = useRoomStore.getState().roomId;
+  if (!roomId || rawFiles.length === 0) {
+    console.warn('[CLOUD] Aborting startCloudUpload: missing roomId or files', {roomId, count: rawFiles.length});
     return;
   }
 
-  useTransferStore.getState().setSenderStatus('transferring');
-  console.log(`[TRANSFER] START → ${file.name} to ${activePeers.length} peer(s), mode=${mode}`);
+  useTransferStore.getState().setOverallStatus('transferring');
 
-  if (mode === 'queue') {
-    for (const [socketId, peer] of activePeers) {
-      useTransferStore.getState().setReceiverStatus(socketId, 'transferring');
-      await sendFileToPeer(file, socketId, peer.dc!);
+  for (let i = 0; i < rawFiles.length; i++) {
+    if (_isCancelled) break;
+    const file  = rawFiles[i];
+    const entry = fileEntries[i];
+    if (!file || !entry) continue;
+
+    useTransferStore.getState().setFileStatus(i, 'preparing');
+
+    console.log(`[CLOUD] Computing checksum for file ${i}...`);
+    // Compute SHA-256 before upload so receiver can verify integrity
+    const checksum = await computeFileChecksum(file);
+    console.log(`[CLOUD] Checksum computed: ${checksum}`);
+
+    try {
+      useTransferStore.getState().setFileStatus(i, 'transferring');
+      console.log(`[CLOUD] Uploading file ${i}...`);
+      await uploadFileToCloud(file, entry, i, rawFiles.length, roomId, checksum);
+      console.log(`[CLOUD] Upload complete for file ${i}`);
+    } catch (err) {
+      if (_isCancelled) break;
+      useTransferStore.getState().setFileStatus(i, 'failed');
+      toast.error(`Failed to upload ${entry.name}`);
     }
-  } else {
-    await Promise.all(activePeers.map(([socketId, peer]) => {
-      useTransferStore.getState().setReceiverStatus(socketId, 'transferring');
-      return sendFileToPeer(file, socketId, peer.dc!);
-    }));
   }
-};
 
-const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promise<void> => {
+  if (!_isCancelled) {
+    useTransferStore.getState().setOverallStatus('completed');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SENDER: Per-file pump with backpressure, adaptive chunk size, and resume
+// ─────────────────────────────────────────────────────────────────────────────
+function sendFileToPeer(file: File, entry: FileEntry, fileIndex: number, dc: RTCDataChannel): Promise<void> {
   return new Promise((resolve) => {
-    console.log(`[WEBRTC] sendFileToPeer: attaching sync_offset listener for ${socketId}`);
+    const senderHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
+    senderHashWorker.postMessage({ type: 'init' });
 
     let retryTimeout: ReturnType<typeof setTimeout>;
     let abortTimeout: ReturnType<typeof setTimeout>;
 
-    // Step 1: Attach listener FIRST
+    // Step 1: Attach listener FIRST, then send metadata
     const onMessage = (event: MessageEvent) => {
       if (typeof event.data !== 'string') return;
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'sync_offset') {
-          console.log(`[WEBRTC] SYNC_OFFSET RECEIVED from ${socketId}: offset=${data.offset}`);
           clearTimeout(retryTimeout);
           clearTimeout(abortTimeout);
           dc.removeEventListener('message', onMessage);
           startPumping(data.offset || 0);
         }
-      } catch (e) {
-        console.error('[WEBRTC] Handshake parse error:', e);
-      }
+      } catch (_) {}
     };
     dc.addEventListener('message', onMessage);
 
-    // Step 2: Send metadata AFTER listener is attached
-    const sendMetadata = () => {
-      const meta = JSON.stringify({ type: 'metadata', name: file.name, size: file.size, fileType: file.type });
-      console.log(`[WEBRTC] METADATA SEND → ${socketId}: ${file.name} (${file.size} bytes)`);
-      dc.send(meta);
+    const sendMeta = () => {
+      dc.send(JSON.stringify({
+        type:         'metadata',
+        name:         entry.name,
+        relativePath: entry.relativePath,
+        size:         entry.size,
+        fileType:     entry.type,
+        fileIndex,
+      }));
     };
-    sendMetadata();
+    sendMeta();
 
-    // Retry after 8s if no sync_offset received
+    // Retry metadata if no sync_offset in 8s
     retryTimeout = setTimeout(() => {
-      console.warn(`[WEBRTC] sync_offset timeout (8s) for ${socketId} — retrying metadata`);
-      sendMetadata();
+      sendMeta();
       abortTimeout = setTimeout(() => {
-        console.error(`[WEBRTC] Handshake permanently failed for ${socketId}`);
         dc.removeEventListener('message', onMessage);
-        useTransferStore.getState().setReceiverStatus(socketId, 'failed');
-        toast.error('Receiver init failed. Please reconnect.');
+        useTransferStore.getState().setFileStatus(fileIndex, 'failed');
+        senderHashWorker.terminate();
         resolve();
       }, 8000);
     }, 8000);
 
-    const startPumping = (initialOffset: number) => {
-      console.log(`[CHUNK] PUMP START for ${socketId} from offset ${initialOffset}`);
-      const senderHashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
-      senderHashWorker.postMessage({ type: 'init' });
-
-      let offset = initialOffset;
-      const txStartTime = performance.now();
-      let retryCount = 0;
+    function startPumping(initialOffset: number): void {
+      let offset       = initialOffset;
+      let bytesAccum   = 0;
       let lastUiUpdate = performance.now();
-      let bytesAccum = 0;
+      let txStart      = performance.now();
+      let isPaused     = false;
+      let pumping      = false;
+      let retries      = 0;
 
-      const HIGH_WATER = 2 * 1024 * 1024; // 2 MB
-      dc.bufferedAmountLowThreshold = 512 * 1024; // 512 KB
-      let isPaused = false;
-      let pumping = false;
+      const HIGH_WATER  = 2 * 1024 * 1024;
+      const maxChunk    = getMaxChunk();
+      let   chunkSize   = maxChunk;
 
-      const maxChunk = getBrowserMaxChunk(socketId);
-      let currentChunkSize = Math.min(256 * 1024, maxChunk);
+      dc.bufferedAmountLowThreshold = 512 * 1024;
 
-      const readSlice = (o: number, size: number): Promise<ArrayBuffer> =>
+      const readSlice = (o: number, sz: number): Promise<ArrayBuffer> =>
         new Promise((res, rej) => {
           const reader = new FileReader();
-          reader.onload = (e) => res(e.target?.result as ArrayBuffer);
+          reader.onload  = (e) => res(e.target!.result as ArrayBuffer);
           reader.onerror = rej;
-          reader.readAsArrayBuffer(file.slice(o, o + size));
+          reader.readAsArrayBuffer(file.slice(o, o + sz));
         });
 
-      let nextChunkPromise: Promise<ArrayBuffer> | null = null;
-      const prefetch = (o: number) => {
-        if (o < file.size) {
-          const sz = Math.min(currentChunkSize, file.size - o);
-          nextChunkPromise = readSlice(o, sz);
-        } else {
-          nextChunkPromise = null;
-        }
-      };
-      prefetch(offset);
-
-      let firstChunk = true;
+      let prefetched: Promise<ArrayBuffer> | null = readSlice(offset, Math.min(chunkSize, file.size - offset));
 
       const pump = async () => {
         if (pumping) return;
         pumping = true;
 
         while (offset < file.size) {
-          if (dc.readyState !== 'open') { resolve(); return; }
+          if (_isCancelled) { pumping = false; resolve(); return; }
 
-          if (dc.bufferedAmount > HIGH_WATER) {
-            isPaused = true;
+          if (_isPaused) {
+            useTransferStore.getState().setFileStatus(fileIndex, 'paused');
             pumping = false;
+            // Will be restarted by dc.onbufferedamountlow or resume signal
+            const resumeCheck = setInterval(() => {
+              if (!_isPaused && !_isCancelled) {
+                clearInterval(resumeCheck);
+                useTransferStore.getState().setFileStatus(fileIndex, 'transferring');
+                pump();
+              }
+            }, 200);
             return;
           }
 
-          try {
-            if (!nextChunkPromise) prefetch(offset);
-            const chunk = await nextChunkPromise!;
+          if (dc.readyState !== 'open') { pumping = false; resolve(); return; }
+          if (dc.bufferedAmount > HIGH_WATER) {
+            isPaused = true; pumping = false; return;
+          }
 
-            if (firstChunk) {
-              console.log(`[CHUNK] SEND 0 → ${socketId}`);
-              firstChunk = false;
-            }
+          try {
+            if (!prefetched) prefetched = readSlice(offset, Math.min(chunkSize, file.size - offset));
+            const chunk = await prefetched;
 
             dc.send(chunk);
             senderHashWorker.postMessage({ type: 'update', chunk });
-            offset += chunk.byteLength;
+            offset     += chunk.byteLength;
             bytesAccum += chunk.byteLength;
-            retryCount = 0;
+            retries     = 0;
 
-            const now = performance.now();
-            const elapsed = (now - txStartTime) / 1000;
-            const speed = elapsed > 0 ? offset / elapsed : 0;
+            const now     = performance.now();
+            const elapsed = (now - txStart) / 1000;
+            const speed   = elapsed > 0 ? offset / elapsed : 0;
 
             // Adaptive chunk size
-            if (speed > 5 * 1024 * 1024) currentChunkSize = maxChunk;
-            else if (speed > 1 * 1024 * 1024) currentChunkSize = Math.min(256 * 1024, maxChunk);
-            else currentChunkSize = Math.min(128 * 1024, maxChunk);
+            if (speed > 5 * 1024 * 1024)     chunkSize = maxChunk;
+            else if (speed > 1 * 1024 * 1024) chunkSize = Math.min(256 * 1024, maxChunk);
+            else                               chunkSize = Math.min(128 * 1024, maxChunk);
 
-            prefetch(offset);
+            prefetched = offset < file.size
+              ? readSlice(offset, Math.min(chunkSize, file.size - offset))
+              : null;
 
             if (now - lastUiUpdate > 250 || offset >= file.size) {
-              useTransferStore.getState().updateReceiverState(socketId, bytesAccum, speed);
-              bytesAccum = 0;
+              useTransferStore.getState().updateFileProgress(fileIndex, bytesAccum, speed);
+              bytesAccum   = 0;
               lastUiUpdate = now;
             }
           } catch (e) {
-            console.error(`[CHUNK] Error sending to ${socketId}:`, e);
-            if (retryCount < 5) {
-              retryCount++;
-              nextChunkPromise = null;
-              await new Promise(r => setTimeout(r, 500));
+            if (retries++ < 5) {
+              prefetched = null;
+              await new Promise((r) => setTimeout(r, 500));
             } else {
-              useTransferStore.getState().setReceiverStatus(socketId, 'failed');
-              const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-              useTransferStore.getState().addHistoryRecord({
-                fileName: file.name, size: file.size, mode: 'send',
-                deviceName: receiverInfo?.name || 'Unknown', date: Date.now(),
-                status: 'Failed', duration: (performance.now() - txStartTime) / 1000,
-              });
+              useTransferStore.getState().setFileStatus(fileIndex, 'failed');
               senderHashWorker.terminate();
+              pumping = false;
               resolve();
               return;
             }
           }
         }
 
-        // EOF
-        if (offset >= file.size) {
-          senderHashWorker.onmessage = (e) => {
-            if (e.data.type === 'result') {
-              dc.send(JSON.stringify({
-                type: 'eof', hash: e.data.hash,
-                totalChunks: e.data.chunkCount,
-                fileSize: file.size,
-                transferTime: performance.now() - txStartTime,
-              }));
-              useTransferStore.getState().setReceiverStatus(socketId, 'completed');
-              const receiverInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-              useTransferStore.getState().addHistoryRecord({
-                fileName: file.name, size: file.size, mode: 'send',
-                deviceName: receiverInfo?.name || 'Unknown', date: Date.now(),
-                status: 'Completed', duration: (performance.now() - txStartTime) / 1000,
-              });
-              senderHashWorker.terminate();
+        // EOF — compute final hash, send to receiver
+        senderHashWorker.onmessage = (e) => {
+          if (e.data.type !== 'result') return;
+          dc.send(JSON.stringify({
+            type:      'eof',
+            hash:      e.data.hash,
+            fileSize:  file.size,
+            fileIndex,
+          }));
+          useTransferStore.getState().setFileStatus(fileIndex, 'verifying');
+          senderHashWorker.terminate();
+          pumping = false;
+          // Wait for receiver's integrity_ack before resolving
+        };
+        senderHashWorker.postMessage({ type: 'finish' });
+
+        // Listen for ack from receiver
+        const ackListener = (ev: MessageEvent) => {
+          if (typeof ev.data !== 'string') return;
+          try {
+            const d = JSON.parse(ev.data);
+            if (d.type === 'integrity_ack' && d.fileIndex === fileIndex) {
+              dc.removeEventListener('message', ackListener);
+              if (d.passed) {
+                useTransferStore.getState().setFileStatus(fileIndex, 'completed');
+              } else {
+                useTransferStore.getState().setFileStatus(fileIndex, 'failed');
+                toast.error(`Integrity check failed for ${entry.name}`);
+              }
               resolve();
             }
-          };
-          senderHashWorker.postMessage({ type: 'finish' });
-          return;
-        }
-
-        pumping = false;
+          } catch (_) {}
+        };
+        dc.addEventListener('message', ackListener);
       };
 
       dc.onbufferedamountlow = () => {
@@ -528,6 +434,167 @@ const sendFileToPeer = (file: File, socketId: string, dc: RTCDataChannel): Promi
       };
 
       pump();
-    };
+    }
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RECEIVER: Incoming data handler (multi-file aware)
+// ─────────────────────────────────────────────────────────────────────────────
+interface ReceiverState {
+  buffer:     ArrayBuffer[];
+  received:   number;
+  meta:       any;
+  rxStart:    number;
+  hashWorker: Worker | null;
+  lastUpdate: number;
+  bytesAccum: number;
+}
+
+const rxState: ReceiverState = {
+  buffer:     [],
+  received:   0,
+  meta:       null,
+  rxStart:    0,
+  hashWorker: null,
+  lastUpdate: 0,
+  bytesAccum: 0,
 };
+
+const handleIncomingData = (event: MessageEvent) => {
+  if (typeof event.data === 'string') {
+    try {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'metadata') {
+        // New file incoming
+        if (!rxState.hashWorker) {
+          rxState.hashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
+        }
+        rxState.hashWorker.postMessage({ type: 'init' });
+        rxState.meta     = data;
+        rxState.buffer   = [];
+        rxState.received = 0;
+        rxState.rxStart  = performance.now();
+        rxState.lastUpdate = rxState.rxStart;
+        rxState.bytesAccum = 0;
+
+        useTransferStore.getState().setOverallStatus('transferring');
+        useTransferStore.getState().setFileStatus(data.fileIndex, 'transferring');
+
+        // Acknowledge with current offset (resume support)
+        dataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: rxState.received }));
+
+      } else if (data.type === 'eof') {
+        // Verify integrity
+        rxState.hashWorker!.onmessage = (e) => {
+          if (e.data.type !== 'result') return;
+          const passed = e.data.hash === data.hash && rxState.received === data.fileSize;
+
+          // Send ack back to sender via DataChannel
+          dataChannel?.send(JSON.stringify({
+            type:      'integrity_ack',
+            fileIndex: data.fileIndex,
+            passed,
+          }));
+
+          if (passed) {
+            finishReceiving(data.fileIndex);
+          } else {
+            useTransferStore.getState().setFileStatus(data.fileIndex, 'failed');
+            toast.error(`File integrity check failed: ${rxState.meta?.name}`);
+          }
+          rxState.hashWorker?.terminate();
+          rxState.hashWorker = null;
+        };
+        rxState.hashWorker!.postMessage({ type: 'finish' });
+      }
+    } catch (_) {}
+  } else {
+    // Binary chunk
+    const chunk = event.data as ArrayBuffer;
+    rxState.buffer.push(chunk);
+    rxState.hashWorker?.postMessage({ type: 'update', chunk });
+    rxState.received   += chunk.byteLength;
+    rxState.bytesAccum += chunk.byteLength;
+
+    const now     = performance.now();
+    const elapsed = (now - rxState.rxStart) / 1000;
+    const speed   = elapsed > 0 ? rxState.received / elapsed : 0;
+
+    if (now - rxState.lastUpdate > 250) {
+      useTransferStore.getState().updateFileProgress(
+        rxState.meta?.fileIndex ?? 0,
+        rxState.bytesAccum,
+        speed
+      );
+      rxState.bytesAccum = 0;
+      rxState.lastUpdate  = now;
+    }
+  }
+};
+
+async function finishReceiving(fileIndex: number): Promise<void> {
+  useTransferStore.getState().setFileStatus(fileIndex, 'completed');
+
+  if (fileIndex === (rxState.meta?.totalFiles ?? 1) - 1) {
+    useTransferStore.getState().setOverallStatus('completed');
+  }
+
+  const blob   = new Blob(rxState.buffer, { type: rxState.meta?.fileType || 'application/octet-stream' });
+  const url    = URL.createObjectURL(blob);
+  const a      = document.createElement('a');
+  a.href       = url;
+  a.download   = rxState.meta?.name ?? 'file';
+  a.click();
+  URL.revokeObjectURL(url);
+
+  const duration = (performance.now() - rxState.rxStart) / 1000;
+  toast.success(`Downloaded: ${rxState.meta?.name}`);
+
+  useTransferStore.getState().addHistoryRecord({
+    filename:    rxState.meta?.name,
+    size:        rxState.meta?.size,
+    mode:        'receive',
+    networkMode: 'local',
+    date:        Date.now(),
+    status:      'Completed',
+    duration,
+  });
+
+  rxState.buffer = [];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility: compute SHA-256 of full file (for cloud uploads)
+// ─────────────────────────────────────────────────────────────────────────────
+export async function computeFileChecksum(file: File): Promise<string> {
+  return new Promise((resolve) => {
+    const worker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
+    worker.postMessage({ type: 'init' });
+
+    const CHUNK = 4 * 1024 * 1024; // 4 MB
+    let offset = 0;
+
+    const processNext = () => {
+      if (offset >= file.size) {
+        worker.onmessage = (e) => {
+          if (e.data.type === 'result') { worker.terminate(); resolve(e.data.hash); }
+        };
+        worker.postMessage({ type: 'finish' });
+        return;
+      }
+      const reader = new FileReader();
+      const slice  = file.slice(offset, offset + CHUNK);
+      reader.onload = (e) => {
+        const chunk = e.target!.result as ArrayBuffer;
+        worker.postMessage({ type: 'update', chunk });
+        offset += chunk.byteLength;
+        processNext();
+      };
+      reader.readAsArrayBuffer(slice);
+    };
+
+    processNext();
+  });
+}

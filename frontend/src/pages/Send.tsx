@@ -1,378 +1,458 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import QRCode from 'react-qr-code';
-import { motion } from 'framer-motion';
-import { FiUploadCloud, FiCheck, FiX, FiActivity, FiSettings, FiTrash2 } from 'react-icons/fi';
-import toast from 'react-hot-toast';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  FiUploadCloud, FiFile, FiFolder, FiX, FiCopy, FiCheck,
+  FiZap, FiCloud, FiLoader, FiPause, FiPlay,
+} from 'react-icons/fi';
 import { socket, connectSocket } from '../services/socket';
-import { removePeer, clearPeers } from '../services/webrtc';
+import { closeWebRTC, pauseWebRTC, resumeWebRTC, cancelWebRTC } from '../services/webrtc';
+import { cancelCloudUpload } from '../services/cloudTransfer';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
-import type { TransferMode } from '../../../shared/types';
+import type { FileEntry } from '../../../shared/types';
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const formatSize = (bytes: number): string => {
+  if (bytes === 0) return '0 B';
+  const k = 1024, units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${units[i]}`;
+};
+
+const formatTime = (secs: number): string => {
+  if (!isFinite(secs) || secs <= 0) return '--';
+  if (secs < 60) return `${Math.round(secs)}s`;
+  return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
+};
+
+// Collect files from a DataTransfer (supports folders via webkitGetAsEntry)
+async function collectFiles(dataTransfer: DataTransfer): Promise<{ files: File[]; entries: FileEntry[] }> {
+  const files: File[]    = [];
+  const entries: FileEntry[] = [];
+
+  const processEntry = async (entry: FileSystemEntry, path = ''): Promise<void> => {
+    if (entry.isFile) {
+      const fileEntry = entry as FileSystemFileEntry;
+      await new Promise<void>((res) => {
+        fileEntry.file((f) => {
+          const relative = path ? `${path}/${f.name}` : f.name;
+          files.push(f);
+          entries.push({
+            name: f.name, relativePath: relative,
+            size: f.size, type: f.type || 'application/octet-stream',
+            lastModified: f.lastModified,
+          });
+          res();
+        });
+      });
+    } else if (entry.isDirectory) {
+      const dirReader = (entry as FileSystemDirectoryEntry).createReader();
+      await new Promise<void>((res) => {
+        dirReader.readEntries(async (dirEntries) => {
+          for (const e of dirEntries) {
+            await processEntry(e, path ? `${path}/${entry.name}` : entry.name);
+          }
+          res();
+        });
+      });
+    }
+  };
+
+  // Use webkitGetAsEntry for folder support
+  const items = Array.from(dataTransfer.items);
+  for (const item of items) {
+    const entry = item.webkitGetAsEntry?.();
+    if (entry) await processEntry(entry);
+    else {
+      const f = item.getAsFile();
+      if (f) {
+        files.push(f);
+        entries.push({ name: f.name, relativePath: f.name, size: f.size, type: f.type || 'application/octet-stream', lastModified: f.lastModified });
+      }
+    }
+  }
+
+  return { files, entries };
+}
+
+// Normalise regular file input (no folder support)
+function fromFileList(fileList: FileList): { files: File[]; entries: FileEntry[] } {
+  const files: File[]    = [];
+  const entries: FileEntry[] = [];
+  Array.from(fileList).forEach((f) => {
+    files.push(f);
+    entries.push({ name: f.name, relativePath: f.webkitRelativePath || f.name, size: f.size, type: f.type || 'application/octet-stream', lastModified: f.lastModified });
+  });
+  return { files, entries };
+}
+
+// ── Component ──────────────────────────────────────────────────────────────────
+type SendState = 'picking' | 'waiting' | 'transferring' | 'done';
 
 const Send: React.FC = () => {
-  const { roomData, pendingRequests, connectedReceivers } = useRoomStore();
-  const { files, setFiles, senderStatus, receiverStates, totalBytes } = useTransferStore();
-  
+  const { roomId, token, peerConnected, networkMode } = useRoomStore();
+  const {
+    files, fileStates, overallStatus, overallSpeedBps, overallEtaSeconds,
+    totalBytesTransferred, totalBytes, isPaused, currentFileIndex,
+  } = useTransferStore();
+
+  const [sendState, setSendState]   = useState<SendState>('picking');
   const [dragActive, setDragActive] = useState(false);
-  const [selectedMode, setSelectedMode] = useState<TransferMode>('private');
-  const [maxReceivers, setMaxReceivers] = useState(1);
-  const [roomCreated, setRoomCreated] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
+  const fileInputRef                = useRef<HTMLInputElement>(null);
+  const folderInputRef              = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     connectSocket();
     useTransferStore.getState().setRole('sender');
-    
-    const checkReclaim = async () => {
-      const room = useRoomStore.getState().roomData;
-      const sessionFiles = sessionStorage.getItem('chikko_files');
-      
-      if (room && sessionFiles) {
-        socket.emit('reclaim_room', { roomId: room.roomId, token: room.token }, (res: any) => {
-          if (res.error) {
-            useRoomStore.getState().reset();
-          } else {
-            toast.success('Session restored! Please re-select your files to resume.');
-            setRoomCreated(true);
-            if (res.approvedReceivers) {
-              res.approvedReceivers.forEach((ar: any) => {
-                useRoomStore.getState().addConnectedReceiver(ar.socketId, ar.deviceInfo);
-              });
-            }
-          }
-        });
-      }
+    return () => {
+      useRoomStore.getState().reset();
+      useTransferStore.getState().reset();
+      import('../services/webrtc').then((m) => m.closeWebRTC());
     };
-    
-    // Tiny delay to ensure socket connects before emitting reclaim
-    setTimeout(checkReclaim, 500);
   }, []);
 
-  const handleCreateRoom = () => {
-    if (selectedFiles.length === 0) return toast.error('Please select at least one file to send.');
-    
-    // Store File objects on window BEFORE clearing state so dc.onopen can access them
-    (window as any).__chikkoFiles = selectedFiles;
+  // Advance state when transfer completes
+  useEffect(() => {
+    if (overallStatus === 'completed' || overallStatus === 'cancelled') {
+      setSendState('done');
+    } else if (overallStatus === 'transferring') {
+      setSendState('transferring');
+    }
+  }, [overallStatus]);
 
-    clearPeers();
-    useRoomStore.getState().reset();
+  // ── File selection ─────────────────────────────────────────────────────────
+  const handleFiles = useCallback(async (fileObjs: File[], entryObjs: FileEntry[]) => {
+    if (fileObjs.length === 0) return;
+
     useTransferStore.getState().reset();
+    (window as any).__chikkoFiles = fileObjs;
     useTransferStore.getState().setRole('sender');
-    useTransferStore.getState().setFiles(selectedFiles.map(f => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified })));
-    
-    let senderName = localStorage.getItem('chikko_device_name');
-    if (!senderName) {
-      senderName = `Sender-${Math.floor(Math.random() * 10000)}`;
-      localStorage.setItem('chikko_device_name', senderName);
-    }
-    
-    socket.emit('create_room', { 
-      transferMode: selectedMode, 
-      maxReceivers,
-      senderName,
-      fileCount: selectedFiles.length,
-      totalSize: totalBytes
+    useTransferStore.getState().setFiles(entryObjs);
+
+    useRoomStore.getState().reset();
+    closeWebRTC();
+
+    // Auto-create room
+    socket.once('connect', () => {});
+    connectSocket();
+
+    socket.emit('create_room', (data) => {
+      useRoomStore.getState().setRoom(data.roomId, data.token);
+      setSendState('waiting');
     });
-    setRoomCreated(true);
-  };
+  }, []);
 
-  const handleFiles = (newFiles: File[]) => {
-    const sessionFilesStr = sessionStorage.getItem('chikko_files');
-    if (sessionFilesStr && roomCreated) {
-       const sessionFiles = JSON.parse(sessionFilesStr);
-       if (newFiles.length !== sessionFiles.length) {
-         return toast.error(`Expected ${sessionFiles.length} files. Please select the correct files to resume.`);
-       }
-       for (let i = 0; i < newFiles.length; i++) {
-         if (newFiles[i].name !== sessionFiles[i].name || newFiles[i].size !== sessionFiles[i].size || newFiles[i].lastModified !== sessionFiles[i].lastModified) {
-           return toast.error(`File mismatch: ${newFiles[i].name}. Please select the exact original files.`);
-         }
-       }
-       toast.success('Files validated! Ready to resume transfer.');
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragActive(false);
+    const { files: f, entries: en } = await collectFiles(e.dataTransfer);
+    if (f.length) handleFiles(f, en);
+  }, [handleFiles]);
+
+  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files?.length) {
+      const { files: f, entries: en } = fromFileList(e.target.files);
+      handleFiles(f, en);
     }
-
-    // Store actual File objects on window so dc.onopen can access them
-    (window as any).__chikkoFiles = newFiles;
-    setSelectedFiles(newFiles);
-    setFiles(newFiles.map(f => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified })));
   };
 
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-
-  const formatSize = (bytes: number) => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  // ── Room code copy ─────────────────────────────────────────────────────────
+  const copyCode = () => {
+    if (!roomId) return;
+    navigator.clipboard.writeText(roomId).then(() => {
+      setCodeCopied(true);
+      setTimeout(() => setCodeCopied(false), 2000);
+    });
   };
 
-
-
-  // Transfer is now triggered automatically from dc.onopen inside webrtc.ts.
-  // No useEffect needed here — this eliminates the React closure race condition.
-
-  const approveRequest = (socketId: string) => {
-    if (!roomData) return;
-    socket.emit('approve_request', { roomId: roomData.roomId, receiverSocketId: socketId });
-    useRoomStore.getState().removePendingRequest(socketId);
+  // ── Pause / Resume ─────────────────────────────────────────────────────────
+  const handlePause = () => {
+    useTransferStore.getState().setPaused(true);
+    pauseWebRTC();
+  };
+  const handleResume = () => {
+    useTransferStore.getState().setPaused(false);
+    resumeWebRTC();
+  };
+  const handleCancel = () => {
+    cancelWebRTC();
+    cancelCloudUpload();
+    useTransferStore.getState().cancel();
   };
 
-  const rejectRequest = (socketId: string) => {
-    if (!roomData) return;
-    socket.emit('reject_request', { roomId: roomData.roomId, receiverSocketId: socketId, reason: 'Sender rejected.' });
-    useRoomStore.getState().removePendingRequest(socketId);
+  // ── QR data ───────────────────────────────────────────────────────────────
+  const qrValue = roomId && token
+    ? JSON.stringify({ roomId, token, v: 3 })
+    : '';
+
+  // ── Network badge ─────────────────────────────────────────────────────────
+  const NetworkBadge = () => {
+    if (networkMode === 'local')
+      return <span className="flex items-center gap-1 text-emerald-400 text-xs font-medium"><FiZap /> Local (WebRTC)</span>;
+    if (networkMode === 'cloud')
+      return <span className="flex items-center gap-1 text-blue-400 text-xs font-medium"><FiCloud /> Cloud (B2)</span>;
+    return <span className="flex items-center gap-1 text-slate-500 text-xs"><FiLoader className="animate-spin" /> Detecting...</span>;
   };
 
-  const handleDisconnectReceiver = (socketId: string) => {
-    removePeer(socketId);
-    useRoomStore.getState().removeConnectedReceiver(socketId);
-  };
-
-  const qrData = roomData ? JSON.stringify({ 
-    roomId: roomData.roomId, 
-    token: roomData.token,
-    version: 1,
-    timestamp: Date.now()
-  }) : '';
-
-  // Calculate aggregates
-  let aggBytes = 0;
-  let aggSpeed = 0;
-  let activeTransfers = 0;
-  receiverStates.forEach(state => {
-    aggBytes += state.bytesTransferred;
-    aggSpeed += state.speedBytesPerSecond;
-    if (state.status === 'transferring') activeTransfers++;
-  });
-  
-  const totalExpectedBytes = totalBytes * (connectedReceivers.size || 1);
-  const aggProgress = totalExpectedBytes > 0 ? (aggBytes / totalExpectedBytes) * 100 : 0;
+  // ── Overall progress bar ──────────────────────────────────────────────────
+  const overallProgress = totalBytes > 0 ? Math.min((totalBytesTransferred / totalBytes) * 100, 100) : 0;
 
   return (
-    <div className="flex flex-col items-center py-8">
-      {!roomCreated ? (
-        <motion.div className="glass-panel w-full max-w-xl p-8" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-          <h2 className="text-3xl font-bold mb-6 flex items-center gap-3"><FiSettings className="text-blue-400"/> Configure Transfer</h2>
-          
-          <div className="mb-8">
-            <label className="block text-slate-300 font-medium mb-3">1. Select Files</label>
-            <div 
-              className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl cursor-pointer p-6 text-center transition-colors
-                ${dragActive ? 'border-blue-500 bg-blue-500/10' : 'border-slate-600 hover:border-slate-500 hover:bg-slate-800/50'}
-              `}
+    <div className="flex flex-col items-center w-full">
+      <AnimatePresence mode="wait">
+
+        {/* ── State: Picking files ─────────────────────────────────────────── */}
+        {sendState === 'picking' && (
+          <motion.div
+            key="picking"
+            className="w-full max-w-lg"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+          >
+            {/* Drop zone */}
+            <div
+              className={`relative flex flex-col items-center justify-center border-2 border-dashed rounded-3xl cursor-pointer p-12 text-center transition-all select-none
+                ${dragActive
+                  ? 'border-blue-500 bg-blue-500/10 scale-[1.01]'
+                  : 'border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-900/60'}`}
               onDragEnter={(e) => { e.preventDefault(); setDragActive(true); }}
               onDragLeave={() => setDragActive(false)}
               onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => { e.preventDefault(); setDragActive(false); if (e.dataTransfer.files) handleFiles(Array.from(e.dataTransfer.files)); }}
-              onClick={() => document.getElementById('file-upload-init')?.click()}
+              onDrop={handleDrop}
+              onClick={() => fileInputRef.current?.click()}
             >
-              <input id="file-upload-init" type="file" multiple className="hidden" onChange={(e) => e.target.files && handleFiles(Array.from(e.target.files))} />
-              <FiUploadCloud className="text-4xl text-slate-400 mb-2" />
-              {selectedFiles.length > 0 ? (
-                <div className="text-blue-400 font-bold">{selectedFiles.length} file(s) selected ({formatSize(totalBytes)})</div>
-              ) : (
-                <p className="text-slate-300">Click or drag files here</p>
+              <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mb-4 transition-all
+                ${dragActive ? 'bg-blue-500/20' : 'bg-slate-800'}`}>
+                <FiUploadCloud className={`text-3xl ${dragActive ? 'text-blue-400' : 'text-slate-400'}`} />
+              </div>
+              <p className="font-semibold text-slate-200 text-lg mb-1">
+                {dragActive ? 'Drop to share' : 'Drop files or folders here'}
+              </p>
+              <p className="text-slate-500 text-sm">
+                or click to browse
+              </p>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleFileInput}
+              />
+            </div>
+
+            {/* Folder button */}
+            <button
+              onClick={() => folderInputRef.current?.click()}
+              className="w-full mt-3 flex items-center justify-center gap-2 bg-slate-800/60 hover:bg-slate-800 text-slate-400 hover:text-slate-200 py-3 rounded-2xl text-sm font-medium transition-colors border border-slate-700/50"
+            >
+              <FiFolder /> Select Folder
+            </button>
+            <input
+              ref={folderInputRef}
+              type="file"
+              // @ts-ignore — webkitdirectory is non-standard but widely supported
+              webkitdirectory=""
+              multiple
+              className="hidden"
+              onChange={handleFileInput}
+            />
+          </motion.div>
+        )}
+
+        {/* ── State: Waiting for receiver ──────────────────────────────────── */}
+        {sendState === 'waiting' && (
+          <motion.div
+            key="waiting"
+            className="w-full max-w-sm"
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <div className="bg-slate-900/60 border border-slate-800/60 rounded-3xl p-8 flex flex-col items-center">
+              {/* QR */}
+              {qrValue && (
+                <div className="bg-white p-3 rounded-2xl mb-6 shadow-xl">
+                  <QRCode value={qrValue} size={180} />
+                </div>
               )}
-            </div>
-          </div>
 
-          <div className="mb-6">
-            <label className="block text-slate-300 font-medium mb-2">2. Transfer Mode</label>
-            <div className="grid grid-cols-3 gap-3">
-              {(['private', 'broadcast', 'queue'] as TransferMode[]).map(mode => (
-                <button
-                  key={mode}
-                  onClick={() => {
-                    setSelectedMode(mode);
-                    if (mode === 'private') setMaxReceivers(1);
-                    else if (maxReceivers === 1) setMaxReceivers(5);
-                  }}
-                  className={`p-3 rounded-xl capitalize font-medium transition-colors border ${
-                    selectedMode === mode 
-                    ? 'bg-blue-600 border-blue-500 text-white' 
-                    : 'bg-slate-900/50 border-slate-700 text-slate-400 hover:border-slate-500'
-                  }`}
-                >
-                  {mode}
-                </button>
-              ))}
-            </div>
-          </div>
+              {/* 6-digit code */}
+              <p className="text-slate-500 text-sm mb-1">Room Code</p>
+              <button
+                onClick={copyCode}
+                className="flex items-center gap-2 font-mono text-4xl font-extrabold tracking-[0.15em] text-white hover:text-blue-300 transition-colors mb-2"
+              >
+                {roomId ?? '------'}
+                {codeCopied ? <FiCheck className="text-emerald-400 text-xl" /> : <FiCopy className="text-slate-600 text-xl" />}
+              </button>
+              <p className="text-slate-500 text-xs mb-6">Tap to copy</p>
 
-          <div className="mb-8">
-            <label className="block text-slate-300 font-medium mb-2">3. Max Receivers</label>
-            <select 
-              value={maxReceivers} 
-              onChange={(e) => setMaxReceivers(Number(e.target.value))}
-              disabled={selectedMode === 'private'}
-              className="w-full bg-slate-900/50 border border-slate-700 rounded-xl p-3 text-white focus:outline-none focus:border-blue-500 disabled:opacity-50"
-            >
-              <option value={1}>1 Receiver</option>
-              <option value={2}>2 Receivers</option>
-              <option value={5}>5 Receivers</option>
-              <option value={10}>10 Receivers</option>
-              <option value={20}>20 Receivers</option>
-            </select>
-          </div>
-
-          <button onClick={handleCreateRoom} className="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold text-lg shadow-lg">
-            Create Session
-          </button>
-        </motion.div>
-      ) : (
-        <div className="w-full max-w-6xl grid grid-cols-1 lg:grid-cols-3 gap-6">
-          
-          {/* Left Column: QR & Pending */}
-          <div className="flex flex-col gap-6">
-            <motion.div className="glass-panel p-6 flex flex-col items-center">
-              {roomData ? (
-                <>
-                  <div className="bg-white p-3 rounded-xl mb-4"><QRCode value={qrData} size={150} /></div>
-                  <p className="text-slate-400 text-sm mb-1">Room Code</p>
-                  <p className="font-mono text-2xl tracking-widest font-bold text-blue-400 mb-2">{roomData.roomId}</p>
-                  <div className="flex gap-2">
-                    <span className="px-2 py-1 bg-slate-800 rounded text-xs capitalize text-slate-300">{roomData.transferMode}</span>
-                    <span className="px-2 py-1 bg-slate-800 rounded text-xs text-slate-300">{connectedReceivers.size} / {roomData.maxReceivers} Connected</span>
+              {/* Files summary */}
+              <div className="w-full bg-slate-800/50 rounded-xl p-3 mb-6 space-y-1 max-h-36 overflow-y-auto">
+                {files.map((f, i) => (
+                  <div key={i} className="flex items-center gap-2 text-sm text-slate-300">
+                    <FiFile className="text-blue-400 shrink-0" />
+                    <span className="truncate flex-1">{f.relativePath || f.name}</span>
+                    <span className="text-slate-500 shrink-0">{formatSize(f.size)}</span>
                   </div>
-                </>
-              ) : (
-                 <div className="animate-pulse h-[250px] bg-slate-800 rounded-xl w-full" />
-              )}
-            </motion.div>
+                ))}
+              </div>
 
-            {pendingRequests.length > 0 && (
-              <motion.div className="glass-panel p-6 border-l-4 border-l-yellow-500">
-                <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-yellow-400">
-                  <FiActivity /> Pending Requests ({pendingRequests.length})
-                </h3>
-                <div className="flex flex-col gap-3">
-                  {pendingRequests.map((req) => (
-                    <div key={req.socketId} className="bg-slate-900/50 p-3 rounded-xl border border-slate-700/50 flex flex-col gap-2">
-                      <div className="font-medium">{req.deviceInfo.name}</div>
-                      <div className="flex gap-2 text-xs text-slate-400 mb-1">
-                        <span className="bg-slate-800 px-2 rounded">{req.deviceInfo.platform}</span>
-                        <span className="bg-slate-800 px-2 rounded">{req.deviceInfo.browser}</span>
-                      </div>
-                      <div className="flex gap-2">
-                        <button onClick={() => approveRequest(req.socketId)} className="flex-1 bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 py-1.5 rounded-lg flex items-center justify-center gap-1"><FiCheck/> Approve</button>
-                        <button onClick={() => rejectRequest(req.socketId)} className="flex-1 bg-red-600/20 hover:bg-red-600/40 text-red-400 py-1.5 rounded-lg flex items-center justify-center gap-1"><FiX/> Reject</button>
-                      </div>
+              {/* Waiting indicator */}
+              {!peerConnected ? (
+                <div className="flex items-center gap-2 text-slate-400 text-sm">
+                  <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" />
+                  Waiting for receiver...
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-blue-400 text-sm">
+                  <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
+                  Receiver connected — establishing connection...
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+
+        {/* ── State: Transferring ──────────────────────────────────────────── */}
+        {sendState === 'transferring' && (
+          <motion.div
+            key="transferring"
+            className="w-full max-w-md"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+          >
+            <div className="bg-slate-900/60 border border-slate-800/60 rounded-3xl p-8">
+              {/* Current file */}
+              <div className="flex items-center gap-3 mb-6">
+                <div className="w-10 h-10 rounded-xl bg-blue-500/20 flex items-center justify-center shrink-0">
+                  <FiFile className="text-blue-400" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="font-semibold text-white truncate">
+                    {files[currentFileIndex]?.name ?? 'Transferring...'}
+                  </p>
+                  <p className="text-slate-500 text-xs">
+                    File {currentFileIndex + 1} of {files.length}
+                  </p>
+                </div>
+                <NetworkBadge />
+              </div>
+
+              {/* Overall progress bar */}
+              <div className="h-3 w-full bg-slate-800 rounded-full overflow-hidden mb-3">
+                <motion.div
+                  className="h-full rounded-full bg-gradient-to-r from-blue-500 to-purple-500"
+                  style={{ width: `${overallProgress}%` }}
+                  transition={{ ease: 'linear', duration: 0.25 }}
+                />
+              </div>
+
+              {/* Stats row */}
+              <div className="flex justify-between text-sm mb-6">
+                <span className="text-slate-300 font-medium">{Math.round(overallProgress)}%</span>
+                <span className="text-slate-400">{formatSize(overallSpeedBps)}/s</span>
+                <span className="text-slate-500">ETA {formatTime(overallEtaSeconds)}</span>
+              </div>
+
+              {/* Bytes */}
+              <p className="text-slate-500 text-xs text-center mb-6">
+                {formatSize(totalBytesTransferred)} / {formatSize(totalBytes)} transferred
+              </p>
+
+              {/* Per-file status (compact) */}
+              {files.length > 1 && (
+                <div className="space-y-1.5 mb-6 max-h-28 overflow-y-auto">
+                  {fileStates.map((fs, i) => (
+                    <div key={i} className="flex items-center gap-2 text-xs">
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        fs.status === 'completed'    ? 'bg-emerald-400' :
+                        fs.status === 'transferring' ? 'bg-blue-400 animate-pulse' :
+                        fs.status === 'failed'       ? 'bg-red-400' :
+                        'bg-slate-600'
+                      }`} />
+                      <span className="truncate flex-1 text-slate-400">{fs.file.name}</span>
+                      <span className="text-slate-500 shrink-0">{Math.round(fs.progress)}%</span>
                     </div>
                   ))}
                 </div>
-              </motion.div>
-            )}
-          </div>
+              )}
 
-          {/* Middle/Right Column: File & Connected */}
-          <div className="lg:col-span-2 flex flex-col gap-6">
-            
-            {/* File Selection / Overall Progress */}
-            <motion.div className="glass-panel p-6">
-               {senderStatus === 'idle' ? (
-                 <div className="flex flex-col h-full justify-center">
-                    {files.length > 0 && (
-                      <div className="flex flex-col items-center justify-center bg-slate-900/50 p-8 rounded-xl border border-slate-700 h-full">
-                        <div className="text-center mb-6">
-                          <div className="text-xl font-bold text-slate-200 mb-2">{files.length} File(s) Ready to Send</div>
-                          <div className="text-slate-400">{formatSize(totalBytes)} total</div>
-                        </div>
-                        <div className="flex flex-col gap-4 items-center w-full max-w-sm">
-                          {connectedReceivers.size === 0 ? (
-                            <div className="flex items-center gap-3 px-6 py-4 bg-slate-800 text-slate-300 font-medium rounded-xl w-full justify-center shadow-inner">
-                              <span className="animate-spin h-5 w-5 border-2 border-slate-500 border-t-slate-300 rounded-full" />
-                              Waiting for receivers to join...
-                            </div>
-                          ) : (
-                            <div className="flex items-center gap-3 px-6 py-4 bg-blue-600/20 text-blue-400 font-bold rounded-xl w-full justify-center border border-blue-500/30">
-                              <span className="animate-pulse h-3 w-3 bg-blue-400 rounded-full" />
-                              Establishing connection...
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                 </div>
-               ) : (
-                 <div className="flex flex-col">
-                    <h3 className="text-xl font-bold mb-4">Overall Progress</h3>
-                    
-                    <div className="grid grid-cols-3 gap-4 mb-6">
-                       <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-700/50">
-                         <div className="text-slate-400 text-sm mb-1">Total Speed</div>
-                         <div className="font-mono text-2xl text-blue-400">{formatSize(aggSpeed)}/s</div>
-                       </div>
-                       <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-700/50">
-                         <div className="text-slate-400 text-sm mb-1">Sent</div>
-                         <div className="font-mono text-2xl text-emerald-400">{formatSize(aggBytes)}</div>
-                       </div>
-                       <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-700/50">
-                         <div className="text-slate-400 text-sm mb-1">Active Transfers</div>
-                         <div className="font-mono text-2xl text-purple-400">{activeTransfers}</div>
-                       </div>
-                    </div>
+              {/* Controls */}
+              <div className="flex gap-3">
+                {isPaused ? (
+                  <button
+                    onClick={handleResume}
+                    className="flex-1 flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-xl font-semibold transition-colors"
+                  >
+                    <FiPlay /> Resume
+                  </button>
+                ) : (
+                  <button
+                    onClick={handlePause}
+                    className="flex-1 flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-200 py-3 rounded-xl font-semibold transition-colors"
+                  >
+                    <FiPause /> Pause
+                  </button>
+                )}
+                <button
+                  onClick={handleCancel}
+                  className="flex items-center justify-center gap-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 px-5 py-3 rounded-xl font-semibold transition-colors"
+                >
+                  <FiX /> Cancel
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
 
-                    <div className="h-4 w-full bg-slate-800 rounded-full overflow-hidden">
-                      <div className="h-full bg-gradient-to-r from-blue-500 to-emerald-500 transition-all duration-300" style={{ width: `${aggProgress}%` }} />
-                    </div>
-                 </div>
-               )}
-            </motion.div>
+        {/* ── State: Done ──────────────────────────────────────────────────── */}
+        {sendState === 'done' && (
+          <motion.div
+            key="done"
+            className="w-full max-w-sm text-center"
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+          >
+            <div className="bg-slate-900/60 border border-slate-800/60 rounded-3xl p-10 flex flex-col items-center">
+              <div className={`w-20 h-20 rounded-full flex items-center justify-center mb-6 ${
+                overallStatus === 'cancelled' ? 'bg-slate-800' : 'bg-emerald-500/15'
+              }`}>
+                {overallStatus === 'cancelled'
+                  ? <FiX className="text-slate-400 text-4xl" />
+                  : <FiCheck className="text-emerald-400 text-4xl" />
+                }
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">
+                {overallStatus === 'cancelled' ? 'Transfer Cancelled' : 'All Done!'}
+              </h2>
+              <p className="text-slate-400 mb-8">
+                {overallStatus === 'cancelled'
+                  ? 'The transfer was cancelled.'
+                  : `${files.length} file${files.length > 1 ? 's' : ''} sent successfully.`
+                }
+              </p>
+              <button
+                onClick={() => {
+                  useRoomStore.getState().reset();
+                  useTransferStore.getState().reset();
+                  closeWebRTC();
+                  setSendState('picking');
+                }}
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white py-3 rounded-xl font-bold transition-colors"
+              >
+                Send More Files
+              </button>
+            </div>
+          </motion.div>
+        )}
 
-            {/* Connected Receivers List */}
-            <motion.div className="glass-panel p-6 flex-1">
-               <h3 className="font-bold text-lg mb-4 flex items-center justify-between">
-                 <span>Connected Receivers ({connectedReceivers.size})</span>
-               </h3>
-               
-               {connectedReceivers.size === 0 ? (
-                 <div className="text-center text-slate-500 py-8">Waiting for devices to connect...</div>
-               ) : (
-                 <div className="flex flex-col gap-4">
-                   {Array.from(connectedReceivers.entries()).map(([socketId, device]) => {
-                      const state = receiverStates.get(socketId);
-                      const isTransferring = state?.status === 'transferring';
-                      
-                      return (
-                        <div key={socketId} className="bg-slate-900/40 p-4 rounded-xl border border-slate-700/50">
-                          <div className="flex justify-between items-start mb-3">
-                            <div>
-                              <div className="font-medium text-lg">{device.name}</div>
-                              <div className="text-xs text-slate-400">ID: {device.deviceId} • {device.platform}</div>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <div className={`px-2 py-1 text-xs rounded font-bold uppercase
-                                ${state?.status === 'completed' ? 'bg-emerald-500/10 text-emerald-400' :
-                                  state?.status === 'transferring' ? 'bg-blue-500/10 text-blue-400' :
-                                  state?.status === 'failed' ? 'bg-red-500/10 text-red-400' : 'bg-slate-500/10 text-slate-400'}
-                              `}>
-                                {state?.status || 'connected'}
-                              </div>
-                              <button onClick={() => handleDisconnectReceiver(socketId)} className="text-slate-500 hover:text-red-400 transition-colors p-1"><FiTrash2/></button>
-                            </div>
-                          </div>
-
-                          {(isTransferring || state?.status === 'completed') && state && (
-                            <div>
-                               <div className="flex justify-between text-xs text-slate-300 mb-2">
-                                 <span>{Math.round(state.progress)}%</span>
-                                 <span>{formatSize(state.speedBytesPerSecond)}/s</span>
-                               </div>
-                               <div className="h-2 w-full bg-slate-800 rounded-full overflow-hidden">
-                                 <div className={`h-full transition-all duration-300 ${state.status === 'completed' ? 'bg-emerald-500' : 'bg-blue-500'}`} style={{ width: `${state.progress}%` }} />
-                               </div>
-                            </div>
-                          )}
-                        </div>
-                      )
-                   })}
-                 </div>
-               )}
-            </motion.div>
-          </div>
-        </div>
-      )}
+      </AnimatePresence>
     </div>
   );
 };

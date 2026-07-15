@@ -9,3 +9,18 @@ services:
         value: production
       - key: PORT
         value: 10000
+      # ── Backblaze B2 (optional — WebRTC-only mode if absent) ──────────────
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
+      - key: B2_BUCKET_NAME
+        sync: false
+      - key: B2_ENDPOINT
+        sync: false
+      - key: DOWNLOAD_URL_EXPIRY_SECONDS
+        value: 900
+      - key: DELETE_AFTER_DOWNLOAD_MS
+        value: 600000
+      - key: DELETE_ABANDONED_AFTER_MS
+        value: 86400000

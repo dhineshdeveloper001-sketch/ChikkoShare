@@ -7,28 +7,42 @@
     "build": "tsc",
     "copy-static": "node -e \"fs.cpSync('../frontend/dist', 'public', {recursive: true})\"",
     "start": "node dist/backend/src/server.js",
-    "dev": "nodemon src/server.ts"
+    "dev": "nodemon --exec tsx src/server.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1087.0",
+    "@aws-sdk/lib-storage": "^3.1087.0",
+    "@aws-sdk/s3-request-presigner": "^3.1087.0",
+    "better-sqlite3": "^12.11.1",
     "compression": "^1.8.1",
     "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
     "helmet": "^8.3.0",
+    "mime-types": "^3.0.2",
+    "multer": "^2.2.0",
+    "node-cron": "^4.6.0",
     "socket.io": "^4.8.3",
     "uuid": "^14.0.1"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/mime-types": "^3.0.1",
+    "@types/multer": "^2.2.0",
     "@types/node": "^26.1.1",
+    "@types/node-cron": "^3.0.11",
     "@types/uuid": "^10.0.0",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
+    "tsx": "^4.23.1",
     "typescript": "^7.0.2"
   }
 }

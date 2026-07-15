@@ -1,73 +1,125 @@
-export type TransferMode = 'private' | 'broadcast' | 'queue';
+// ── Network mode ──────────────────────────────────────────────────────────────
+export type NetworkMode = 'detecting' | 'local' | 'cloud';
 
-export interface DeviceInfo {
-  deviceId: string;
-  name: string;
-  browser: string;
-  platform: string;
+// ── File metadata (supports multi-file + folder) ──────────────────────────────
+export interface FileEntry {
+  name: string;        // filename only (e.g. IMG001.jpg)
+  relativePath: string; // path relative to folder root (e.g. Vacation/IMG001.jpg)
+  size: number;
+  type: string;        // MIME type
+  lastModified: number;
 }
 
-export interface RoomData {
+// ── Room data ─────────────────────────────────────────────────────────────────
+export interface RoomCreatedData {
+  roomId: string;  // 6-digit numeric e.g. "847291"
+  token: string;   // 64-char hex for join auth
+}
+
+// ── Cloud transfer info (sent from server to receiver) ────────────────────────
+export interface CloudDownloadData {
+  downloadToken: string;
+  expiresAt: number;
+  fileIndex: number;    // which file in the batch (0-indexed)
+  totalFiles: number;
+  filename: string;
+  size: number;
+  checksum: string;     // SHA-256 hex — receiver verifies after download
+}
+
+// ── Integrity check ───────────────────────────────────────────────────────────
+export interface IntegrityCheckResult {
   roomId: string;
-  token: string;
-  createdAt: number;
-  transferMode: TransferMode;
-  maxReceivers: number;
-  senderName: string;
-  fileCount: number;
-  totalSize: number;
+  fileIndex: number;
+  passed: boolean;
+  receivedChecksum: string;
+  expectedChecksum: string;
 }
 
-export interface RoomMetadata {
-  senderName: string;
-  transferMode: TransferMode;
-  fileCount: number;
-  totalSize: number;
-}
-
-export interface JoinRoomRequest {
-  roomId: string;
-  token: string;
-  deviceInfo: DeviceInfo;
-}
-
+// ── Signaling ─────────────────────────────────────────────────────────────────
 export interface SignalingMessage {
   roomId: string;
-  targetSocketId?: string; // Optional because initial offer might not have it strictly if broadcasted, but we will enforce it
+  targetSocketId?: string;
   senderSocketId?: string;
   type: 'offer' | 'answer' | 'ice-candidate';
   payload: any;
 }
 
-export interface PendingRequest {
-  socketId: string;
-  deviceInfo: DeviceInfo;
-}
-
+// ── Socket event interfaces ───────────────────────────────────────────────────
 export interface ServerToClientEvents {
-  room_created: (data: RoomData) => void;
-  join_request: (request: PendingRequest) => void; // Server tells Sender someone wants to join
-  join_approved: (data: { roomId: string, senderSocketId: string }) => void; // Server tells Receiver they are approved
-  join_rejected: (reason: string) => void; // Server tells Receiver they are rejected
-  receiver_joined: (data: { socketId: string, deviceInfo: DeviceInfo }) => void; // Server tells Sender receiver is fully in
-  
+  // Room lifecycle
+  room_joined:   (data: { receiverSocketId: string }) => void;
+  peer_disconnected: () => void;
+  room_error:    (message: string) => void;
+
+  // WebRTC signaling
   signaling_message: (msg: SignalingMessage) => void;
-  room_error: (message: string) => void;
-  receiver_left: (socketId: string) => void;
-  sender_left: () => void;
-  sender_disconnected: () => void; // Sender temporarily disconnected
-  sender_reconnected: (data: { senderSocketId: string }) => void; // Sender came back
-  room_full: () => void;
+
+  // Network detection result (broadcast to both peers)
+  network_mode_set: (mode: NetworkMode) => void;
+
+  // Cloud path: server tells receiver a file is ready to download
+  cloud_download_ready: (data: CloudDownloadData) => void;
+
+  // Integrity check relay
+  integrity_check_result: (data: IntegrityCheckResult) => void;
 }
 
 export interface ClientToServerEvents {
-  create_room: (data: { transferMode: TransferMode, maxReceivers: number, senderName: string, fileCount: number, totalSize: number }) => void;
-  reclaim_room: (data: { roomId: string, token: string }, callback: (res: { error?: string, roomData?: RoomData, approvedReceivers?: {socketId: string, deviceInfo: DeviceInfo}[] }) => void) => void;
-  get_room_metadata: (data: { roomId: string, token: string }, callback: (res: { error?: string, metadata?: RoomMetadata }) => void) => void;
-  request_join: (data: JoinRoomRequest) => void; // Receiver asks to join
-  approve_request: (data: { roomId: string, receiverSocketId: string }) => void; // Sender approves
-  reject_request: (data: { roomId: string, receiverSocketId: string, reason: string }) => void; // Sender rejects
-  
+  // Sender creates room, receives roomId + token via callback
+  create_room: (callback: (data: RoomCreatedData) => void) => void;
+
+  // Receiver joins room with roomId + token
+  join_room: (
+    data: { roomId: string; token: string },
+    callback: (res: { error?: string }) => void
+  ) => void;
+
+  // WebRTC signaling relay
   signaling_message: (msg: SignalingMessage) => void;
+
+  // Either peer reports detected network mode
+  report_network_mode: (data: { roomId: string; mode: NetworkMode }) => void;
+
+  // Sender: B2 upload for one file complete
+  cloud_upload_complete: (data: {
+    roomId: string;
+    downloadToken: string;
+    expiresAt: number;
+    fileIndex: number;
+    totalFiles: number;
+    filename: string;
+    size: number;
+    checksum: string;
+  }) => void;
+
+  // Receiver: reports integrity check result back to sender
+  integrity_check_result: (data: IntegrityCheckResult) => void;
+
+  // Leave room
   leave_room: (roomId: string) => void;
 }
+
+// ── History record ────────────────────────────────────────────────────────────
+export interface TransferRecord {
+  id: string;
+  filename: string;
+  size: number;
+  mode: 'send' | 'receive';
+  networkMode: NetworkMode;
+  date: number;
+  status: 'Completed' | 'Failed' | 'Cancelled';
+  duration: number; // seconds
+}
+
+// ── Transfer status ───────────────────────────────────────────────────────────
+export type TransferStatus =
+  | 'idle'
+  | 'preparing'
+  | 'connecting'
+  | 'transferring'
+  | 'paused'
+  | 'verifying'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';

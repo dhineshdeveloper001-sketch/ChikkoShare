@@ -1,181 +1,162 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import type { FileEntry, TransferRecord, TransferStatus, NetworkMode } from '../../../shared/types';
 
-export type TransferStatus = 'idle' | 'preparing' | 'connected' | 'transferring' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'rejected';
-
-export interface FileMetadata {
-  name: string;
-  size: number;
-  type: string;
-  lastModified?: number;
-}
-
-export interface ReceiverTransferState {
+// ── Per-file transfer progress ────────────────────────────────────────────────
+export interface FileTransferState {
+  file: FileEntry;
   status: TransferStatus;
-  progress: number;
-  speedBytesPerSecond: number;
   bytesTransferred: number;
+  speedBps: number;       // bytes/sec
   etaSeconds: number;
+  progress: number;       // 0-100
 }
 
-export interface TransferRecord {
-  id: string;
-  fileName: string;
-  size: number;
-  mode: string;
-  deviceName: string;
-  date: number;
-  status: 'Completed' | 'Failed' | 'Cancelled';
-  duration: number;
-}
-
-interface TransferState {
+interface TransferStoreState {
   role: 'sender' | 'receiver' | null;
-  
-  // File details
-  files: FileMetadata[];
-  totalBytes: number;
-  
-  // Global Sender State
-  senderStatus: TransferStatus;
-  receiverStates: Map<string, ReceiverTransferState>; // socketId -> State
-  
-  // Receiver Specific State (if role === 'receiver')
-  myTransferState: ReceiverTransferState;
 
-  // History (Persistent)
+  // Batch of files being transferred
+  files: FileEntry[];
+  totalBytes: number;
+  fileStates: FileTransferState[];
+  currentFileIndex: number;
+
+  // Overall status
+  overallStatus: TransferStatus;
+  networkMode: NetworkMode;
+  isPaused: boolean;
+
+  // Aggregated progress (for display)
+  totalBytesTransferred: number;
+  overallSpeedBps: number;
+  overallEtaSeconds: number;
+
+  // History (persisted to localStorage)
   history: TransferRecord[];
 
   // Actions
   setRole: (role: 'sender' | 'receiver') => void;
-  setSenderStatus: (status: TransferStatus) => void;
-  setFiles: (files: FileMetadata[]) => void;
-  
-  initReceiverState: (socketId: string) => void;
-  updateReceiverState: (socketId: string, bytesAdded: number, speed: number) => void;
-  setReceiverStatus: (socketId: string, status: TransferStatus) => void;
-  
-  // For Receiver Role
-  updateMyState: (bytesAdded: number, speed: number) => void;
-  setMyStatus: (status: TransferStatus) => void;
+  setFiles: (files: FileEntry[]) => void;
+  setNetworkMode: (mode: NetworkMode) => void;
+  setOverallStatus: (status: TransferStatus) => void;
 
-  // History Actions
+  updateFileProgress: (index: number, bytesAdded: number, speedBps: number) => void;
+  setFileStatus: (index: number, status: TransferStatus) => void;
+
+  setPaused: (v: boolean) => void;
+  cancel: () => void;
+
   addHistoryRecord: (record: Omit<TransferRecord, 'id'>) => void;
   clearHistory: () => void;
-
   reset: () => void;
 }
 
-const defaultReceiverState: ReceiverTransferState = {
-  status: 'idle',
-  progress: 0,
-  speedBytesPerSecond: 0,
-  bytesTransferred: 0,
-  etaSeconds: 0,
-};
-
-export const useTransferStore = create<TransferState>()(
+export const useTransferStore = create<TransferStoreState>()(
   persist(
     (set) => ({
       role: null,
       files: [],
       totalBytes: 0,
-      
-      senderStatus: 'idle',
-      receiverStates: new Map(),
-      
-      myTransferState: { ...defaultReceiverState },
-      
+      fileStates: [],
+      currentFileIndex: 0,
+      overallStatus: 'idle',
+      networkMode: 'detecting',
+      isPaused: false,
+      totalBytesTransferred: 0,
+      overallSpeedBps: 0,
+      overallEtaSeconds: 0,
       history: [],
 
-      setRole: (role) => {
-        if (role) sessionStorage.setItem('chikko_role', role);
-        else sessionStorage.removeItem('chikko_role');
-        set({ role });
-      },
-      setSenderStatus: (status) => set({ senderStatus: status }),
+      setRole: (role) => set({ role }),
+
       setFiles: (files) => {
-        const totalBytes = files.reduce((acc, file) => acc + file.size, 0);
-        sessionStorage.setItem('chikko_files', JSON.stringify(files));
-        set({ files, totalBytes });
+        const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
+        const fileStates: FileTransferState[] = files.map((f) => ({
+          file: f,
+          status: 'idle',
+          bytesTransferred: 0,
+          speedBps: 0,
+          etaSeconds: 0,
+          progress: 0,
+        }));
+        // Store raw File objects on window for webrtc.ts to access
+        set({ files, totalBytes, fileStates, currentFileIndex: 0, totalBytesTransferred: 0 });
       },
 
-      initReceiverState: (socketId) => set((state) => {
-        const newMap = new Map(state.receiverStates);
-        newMap.set(socketId, { ...defaultReceiverState, status: 'connected' });
-        return { receiverStates: newMap };
+      setNetworkMode: (networkMode) => set({ networkMode }),
+      setOverallStatus: (overallStatus) => set({ overallStatus }),
+
+      updateFileProgress: (index, bytesAdded, speedBps) => set((state) => {
+        const newStates = [...state.fileStates];
+        const curr = newStates[index];
+        if (!curr) return {};
+
+        const newBytes = curr.bytesTransferred + bytesAdded;
+        const progress = curr.file.size > 0 ? Math.min((newBytes / curr.file.size) * 100, 100) : 0;
+        const eta = speedBps > 0 ? (curr.file.size - newBytes) / speedBps : 0;
+
+        newStates[index] = { ...curr, bytesTransferred: newBytes, speedBps, etaSeconds: eta, progress };
+
+        // Recalculate overall
+        const totalBytesTransferred = newStates.reduce((acc, s) => acc + s.bytesTransferred, 0);
+        const overallSpeedBps = speedBps;
+        const remaining = state.totalBytes - totalBytesTransferred;
+        const overallEtaSeconds = speedBps > 0 ? remaining / speedBps : 0;
+
+        return { fileStates: newStates, totalBytesTransferred, overallSpeedBps, overallEtaSeconds };
       }),
 
-      updateReceiverState: (socketId, bytesAdded, speed) => set((state) => {
-        const newMap = new Map(state.receiverStates);
-        const curr = newMap.get(socketId);
-        if (curr) {
-          const newBytes = curr.bytesTransferred + bytesAdded;
-          const progress = state.totalBytes > 0 ? (newBytes / state.totalBytes) * 100 : 0;
-          const eta = speed > 0 ? (state.totalBytes - newBytes) / speed : 0;
-          
-          newMap.set(socketId, {
-            ...curr,
-            bytesTransferred: newBytes,
-            speedBytesPerSecond: speed,
-            progress: Math.min(progress, 100),
-            etaSeconds: eta,
-          });
+      setFileStatus: (index, status) => set((state) => {
+        const newStates = [...state.fileStates];
+        if (newStates[index]) {
+          newStates[index] = { ...newStates[index], status };
         }
-        return { receiverStates: newMap };
+        // Advance currentFileIndex when a file completes
+        const nextIndex = status === 'completed' ? index + 1 : state.currentFileIndex;
+        return { fileStates: newStates, currentFileIndex: nextIndex };
       }),
 
-      setReceiverStatus: (socketId, status) => set((state) => {
-        const newMap = new Map(state.receiverStates);
-        const curr = newMap.get(socketId);
-        if (curr) {
-          newMap.set(socketId, { ...curr, status });
-        }
-        return { receiverStates: newMap };
-      }),
+      setPaused: (isPaused) => set({ isPaused }),
 
-      updateMyState: (bytesAdded, speed) => set((state) => {
-        const newBytes = state.myTransferState.bytesTransferred + bytesAdded;
-        const progress = state.totalBytes > 0 ? (newBytes / state.totalBytes) * 100 : 0;
-        const eta = speed > 0 ? (state.totalBytes - newBytes) / speed : 0;
-        
-        return {
-          myTransferState: {
-            ...state.myTransferState,
-            bytesTransferred: newBytes,
-            speedBytesPerSecond: speed,
-            progress: Math.min(progress, 100),
-            etaSeconds: eta,
-          }
-        };
-      }),
-
-      setMyStatus: (status) => set((state) => ({
-        myTransferState: { ...state.myTransferState, status }
+      cancel: () => set((state) => ({
+        overallStatus: 'cancelled',
+        isPaused: false,
+        fileStates: state.fileStates.map((s) =>
+          s.status === 'transferring' || s.status === 'paused'
+            ? { ...s, status: 'cancelled' }
+            : s
+        ),
       })),
 
       addHistoryRecord: (record) => set((state) => ({
-        history: [{ ...record, id: Math.random().toString(36).substring(2, 9) }, ...state.history]
+        history: [
+          { ...record, id: crypto.randomUUID() },
+          ...state.history,
+        ].slice(0, 200), // keep last 200 records
       })),
-      
+
       clearHistory: () => set({ history: [] }),
 
       reset: () => {
-        sessionStorage.removeItem('chikko_role');
-        sessionStorage.removeItem('chikko_files');
+        (window as any).__chikkoFiles = [];
         set({
           role: null,
           files: [],
           totalBytes: 0,
-          senderStatus: 'idle',
-          receiverStates: new Map(),
-          myTransferState: { ...defaultReceiverState },
+          fileStates: [],
+          currentFileIndex: 0,
+          overallStatus: 'idle',
+          networkMode: 'detecting',
+          isPaused: false,
+          totalBytesTransferred: 0,
+          overallSpeedBps: 0,
+          overallEtaSeconds: 0,
         });
-      }
+      },
     }),
     {
-      name: 'chikko-transfer-storage',
-      partialize: (state) => ({ history: state.history }), // Only persist history
+      name: 'chikko-transfer-v3',
+      partialize: (state) => ({ history: state.history }),
     }
   )
 );

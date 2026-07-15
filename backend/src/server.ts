@@ -1,25 +1,29 @@
+import './config/env'; // Load env vars first
 import express from 'express';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
-import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 
-// Import shared types
-import {
-  RoomData,
-  JoinRoomRequest,
-  SignalingMessage,
+// Config & services
+import { isCloudEnabled } from './config/env';
+import './config/db'; // Initialize SQLite on startup
+import transferRoutes from './routes/transfer.routes';
+import { startCleanupWorker } from './workers/cleanup.worker';
+
+// Shared types
+import type {
   ServerToClientEvents,
   ClientToServerEvents,
-  TransferMode,
-  DeviceInfo,
+  NetworkMode,
+  SignalingMessage,
 } from '../../shared/types';
 
+// ── Express app ────────────────────────────────────────────────────────────────
 const app = express();
 const httpServer = createServer(app);
 
@@ -28,242 +32,166 @@ app.use(cors());
 app.use(compression());
 app.use(express.json());
 
+// ── Static files ───────────────────────────────────────────────────────────────
 let publicPath = path.join(process.cwd(), 'public');
-if (!fs.existsSync(publicPath)) {
-  publicPath = path.join(__dirname, '../public'); // Local dev: backend/src/../public
-  if (!fs.existsSync(publicPath)) {
-    publicPath = path.join(__dirname, '../../../public'); // Prod: backend/dist/backend/src/../../../public
-  }
-  if (!fs.existsSync(publicPath)) {
-     publicPath = path.join(process.cwd(), 'backend/public'); // Fallback for root execution
-  }
-}
-
+if (!fs.existsSync(publicPath)) publicPath = path.join(__dirname, '../public');
+if (!fs.existsSync(publicPath)) publicPath = path.join(__dirname, '../../../public');
+if (!fs.existsSync(publicPath)) publicPath = path.join(process.cwd(), 'backend/public');
 app.use(express.static(publicPath));
 
-const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+// ── API routes ────────────────────────────────────────────────────────────────
+app.use('/api', transferRoutes);
+
+// ── Cloud status endpoint ─────────────────────────────────────────────────────
+app.get('/api/status', (_req, res) => {
+  res.json({ cloudEnabled: isCloudEnabled, version: 3 });
 });
 
+// ── Socket.IO ─────────────────────────────────────────────────────────────────
+const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  maxHttpBufferSize: 1e8, // 100 MB for signaling (not file data)
+});
+
+// ── Room state ────────────────────────────────────────────────────────────────
 interface RoomState {
   id: string;
   token: string;
   createdAt: number;
-  transferMode: TransferMode;
-  maxReceivers: number;
-  senderName: string;
-  fileCount: number;
-  totalSize: number;
   senderSocketId: string;
-  approvedReceivers: Map<string, DeviceInfo>; // socketId -> DeviceInfo
-  pendingRequests: Map<string, DeviceInfo>; // socketId -> DeviceInfo
-  status: 'active' | 'sender_disconnected';
+  receiverSocketId: string | null;
+  status: 'waiting' | 'connected' | 'transferring' | 'done';
+  networkMode: NetworkMode | null;
   timeoutId: NodeJS.Timeout | null;
 }
 
 const rooms = new Map<string, RoomState>();
-const ROOM_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes (can be longer or reset based on activity)
+const ROOM_EXPIRY_MS = 30 * 60 * 1000; // 30 minutes
 
+// Generate a unique 6-digit numeric room code
+function generateRoomCode(): string {
+  let code: string;
+  do {
+    code = Math.floor(100000 + Math.random() * 900000).toString();
+  } while (rooms.has(code));
+  return code;
+}
+
+// ── Socket handlers ────────────────────────────────────────────────────────────
 io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
-  console.log(`User connected: ${socket.id}`);
 
-  socket.on('create_room', (data) => {
-    const roomId = uuidv4().substring(0, 8).toUpperCase();
-    const formattedRoomId = `${roomId.substring(0, 4)}-${roomId.substring(4)}`;
-    const token = crypto.randomBytes(32).toString('hex');
-    
-    let timeoutId: NodeJS.Timeout | null = null;
-    // We will no longer set an initial timeout unless the sender is completely disconnected.
+  // ── SENDER: Create a room ─────────────────────────────────────────────────
+  socket.on('create_room', (callback) => {
+    const roomId = generateRoomCode();
+    const token  = crypto.randomBytes(32).toString('hex');
 
-    const roomData: RoomState = {
-      id: formattedRoomId,
-      token,
-      createdAt: Date.now(),
-      transferMode: data.transferMode || 'private',
-      maxReceivers: data.maxReceivers || 1,
-      senderName: data.senderName || 'Sender',
-      fileCount: data.fileCount || 0,
-      totalSize: data.totalSize || 0,
+    const timeoutId = setTimeout(() => {
+      if (rooms.has(roomId)) {
+        io.to(roomId).emit('room_error', 'Room expired due to inactivity.');
+        io.in(roomId).socketsLeave(roomId);
+        rooms.delete(roomId);
+      }
+    }, ROOM_EXPIRY_MS);
+
+    const room: RoomState = {
+      id: roomId, token, createdAt: Date.now(),
       senderSocketId: socket.id,
-      approvedReceivers: new Map(),
-      pendingRequests: new Map(),
-      status: 'active',
-      timeoutId: null,
+      receiverSocketId: null,
+      status: 'waiting',
+      networkMode: null,
+      timeoutId,
     };
 
-    rooms.set(formattedRoomId, roomData);
-    socket.join(formattedRoomId);
-    
-    socket.emit('room_created', {
-      roomId: roomData.id,
-      token: roomData.token,
-      createdAt: roomData.createdAt,
-      transferMode: roomData.transferMode,
-      maxReceivers: roomData.maxReceivers,
-      senderName: roomData.senderName,
-      fileCount: roomData.fileCount,
-      totalSize: roomData.totalSize,
-    });
-    console.log(`Room created: ${formattedRoomId} by ${socket.id} (Mode: ${roomData.transferMode})`);
+    rooms.set(roomId, room);
+    socket.join(roomId);
+
+    callback({ roomId, token });
   });
 
-  socket.on('reclaim_room', (data, callback) => {
+  // ── RECEIVER: Join a room ─────────────────────────────────────────────────
+  socket.on('join_room', (data, callback) => {
     const room = rooms.get(data.roomId);
+
     if (!room) {
-      callback({ error: 'Room not found or expired.' });
+      callback({ error: 'Room not found. Check the code and try again.' });
       return;
     }
-    
-    if (room.token !== data.token) {
-      callback({ error: 'Invalid token.' });
+    if (data.token !== 'manual' && room.token !== data.token) {
+      callback({ error: 'Invalid code or link.' });
       return;
     }
-    
-    // Clear timeout if it exists
-    if (room.timeoutId) {
-      clearTimeout(room.timeoutId);
-      room.timeoutId = null;
+    if (room.receiverSocketId !== null) {
+      callback({ error: 'Someone is already connected to this room.' });
+      return;
     }
-    
-    room.status = 'active';
-    room.senderSocketId = socket.id;
-    socket.join(room.id);
-    
-    // Notify receivers that sender is back
-    io.to(room.id).emit('sender_reconnected', { senderSocketId: socket.id });
-    
-    callback({
-      roomData: {
-        roomId: room.id,
-        token: room.token,
-        createdAt: room.createdAt,
-        transferMode: room.transferMode,
-        maxReceivers: room.maxReceivers,
-        senderName: room.senderName,
-        fileCount: room.fileCount,
-        totalSize: room.totalSize
-      },
-      approvedReceivers: Array.from(room.approvedReceivers.entries()).map(([id, info]) => ({ socketId: id, deviceInfo: info }))
-    });
-    console.log(`Room ${room.id} reclaimed by ${socket.id}`);
-  });
 
-  socket.on('get_room_metadata', (data, callback) => {
-    const room = rooms.get(data.roomId);
-    if (!room) {
-      callback({ error: 'Room not found or expired.' });
-      return;
-    }
-    
-    if (room.token !== data.token) {
-      callback({ error: 'Invalid token.' });
-      return;
-    }
-    
-    callback({
-      metadata: {
-        senderName: room.senderName,
-        transferMode: room.transferMode,
-        fileCount: room.fileCount,
-        totalSize: room.totalSize
-      }
+    room.receiverSocketId = socket.id;
+    room.status = 'connected';
+    socket.join(data.roomId);
+
+    callback({});
+
+    // Notify sender that receiver has joined
+    io.to(room.senderSocketId).emit('room_joined', {
+      receiverSocketId: socket.id,
     });
   });
 
-  socket.on('request_join', (data: JoinRoomRequest) => {
-    const room = rooms.get(data.roomId);
-    if (!room) {
-      socket.emit('join_rejected', 'Room not found or expired.');
-      return;
-    }
-    
-    if (room.token !== data.token) {
-      socket.emit('join_rejected', 'Invalid token.');
-      return;
-    }
-
-    if (room.approvedReceivers.size >= room.maxReceivers) {
-      socket.emit('room_full');
-      return;
-    }
-
-    // Add to pending
-    room.pendingRequests.set(socket.id, data.deviceInfo);
-    
-    // Notify Sender
-    io.to(room.senderSocketId).emit('join_request', {
-      socketId: socket.id,
-      deviceInfo: data.deviceInfo
-    });
-    console.log(`User ${socket.id} requested to join room ${data.roomId}`);
-  });
-
-  socket.on('approve_request', (data) => {
-    const room = rooms.get(data.roomId);
-    if (!room || room.senderSocketId !== socket.id) return;
-    
-    const deviceInfo = room.pendingRequests.get(data.receiverSocketId);
-    if (!deviceInfo) return;
-
-    if (room.approvedReceivers.size >= room.maxReceivers) {
-       // In case multiple were approved simultaneously
-       return;
-    }
-
-    room.pendingRequests.delete(data.receiverSocketId);
-    room.approvedReceivers.set(data.receiverSocketId, deviceInfo);
-
-    // Make receiver join the socket.io room (mostly for cleanup/broadcasts)
-    const receiverSocket = io.sockets.sockets.get(data.receiverSocketId);
-    if (receiverSocket) {
-      receiverSocket.join(data.roomId);
-    }
-
-    // Notify Receiver
-    io.to(data.receiverSocketId).emit('join_approved', {
-      roomId: data.roomId,
-      senderSocketId: room.senderSocketId
-    });
-
-    // Notify Sender that receiver is fully approved and connected
-    socket.emit('receiver_joined', {
-      socketId: data.receiverSocketId,
-      deviceInfo
-    });
-
-    console.log(`Sender approved ${data.receiverSocketId} for room ${data.roomId}`);
-  });
-
-  socket.on('reject_request', (data) => {
-    const room = rooms.get(data.roomId);
-    if (!room || room.senderSocketId !== socket.id) return;
-
-    room.pendingRequests.delete(data.receiverSocketId);
-    io.to(data.receiverSocketId).emit('join_rejected', data.reason || 'Sender rejected your request.');
-    console.log(`Sender rejected ${data.receiverSocketId} for room ${data.roomId}`);
-  });
-
+  // ── Signaling relay (WebRTC) ──────────────────────────────────────────────
   socket.on('signaling_message', (msg: SignalingMessage) => {
-    // If target is specified (which it should be for multi-peer), route directly.
-    // Ensure we attach the senderSocketId so the receiver knows who it's from.
     msg.senderSocketId = socket.id;
-    
     if (msg.targetSocketId) {
-       io.to(msg.targetSocketId).emit('signaling_message', msg);
+      io.to(msg.targetSocketId).emit('signaling_message', msg);
     } else {
-       // Fallback for strict 1:1 if needed, but not recommended for broadcast mode.
-       socket.to(msg.roomId).emit('signaling_message', msg);
+      socket.to(msg.roomId).emit('signaling_message', msg);
     }
   });
 
-  socket.on('leave_room', (roomId: string) => {
+  // ── Network mode detected (from sender or receiver) ───────────────────────
+  socket.on('report_network_mode', (data) => {
+    const room = rooms.get(data.roomId);
+    if (!room) return;
+    room.networkMode = data.mode;
+    // Broadcast to both peers in the room
+    io.to(data.roomId).emit('network_mode_set', data.mode);
+  });
+
+  // ── SENDER: Cloud upload finished — send download info to receiver ─────────
+  socket.on('cloud_upload_complete', (data) => {
+    const room = rooms.get(data.roomId);
+    if (!room || room.senderSocketId !== socket.id) return;
+    room.status = 'transferring';
+
+    if (room.receiverSocketId) {
+      io.to(room.receiverSocketId).emit('cloud_download_ready', {
+        downloadToken: data.downloadToken,
+        expiresAt:     data.expiresAt,
+        fileIndex:     data.fileIndex,
+        totalFiles:    data.totalFiles,
+        filename:      data.filename,
+        size:          data.size,
+        checksum:      data.checksum,
+      });
+    }
+  });
+
+  // ── RECEIVER: Integrity check result ─────────────────────────────────────
+  socket.on('integrity_check_result', (data) => {
+    const room = rooms.get(data.roomId);
+    if (!room) return;
+    // Relay result to sender
+    io.to(room.senderSocketId).emit('integrity_check_result', data);
+  });
+
+  // ── Leave room ────────────────────────────────────────────────────────────
+  socket.on('leave_room', (roomId) => {
     socket.leave(roomId);
     handleUserLeave(socket.id, roomId, true);
   });
 
+  // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.id}`);
-    for (const [roomId, room] of rooms.entries()) {
+    for (const roomId of rooms.keys()) {
       handleUserLeave(socket.id, roomId, false);
     }
   });
@@ -274,46 +202,38 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 
     if (room.senderSocketId === socketId) {
       if (isExplicit) {
-        // Explicitly leaving -> close room immediately
-        socket.to(roomId).emit('sender_left');
         if (room.timeoutId) clearTimeout(room.timeoutId);
+        io.to(roomId).emit('peer_disconnected');
+        io.in(roomId).socketsLeave(roomId);
         rooms.delete(roomId);
-        console.log(`Sender explicitly left, closing room ${roomId}`);
       } else {
-        // Disconnected -> Preserve room for 5 minutes
-        room.status = 'sender_disconnected';
-        socket.to(roomId).emit('sender_disconnected');
-        
+        // Keep room alive for reconnect grace period (5 min)
+        io.to(roomId).emit('peer_disconnected');
+        if (room.timeoutId) clearTimeout(room.timeoutId);
         room.timeoutId = setTimeout(() => {
-          if (rooms.has(roomId)) {
-            io.to(roomId).emit('room_error', 'Session Expired (Sender disconnected).');
-            io.in(roomId).socketsLeave(roomId);
-            rooms.delete(roomId);
-            console.log(`Room ${roomId} expired due to sender disconnection timeout.`);
-          }
-        }, ROOM_EXPIRY_MS);
-        
-        console.log(`Sender disconnected from room ${roomId}. Preserving for 5 mins.`);
+          rooms.delete(roomId);
+        }, 5 * 60 * 1000);
       }
-    } else {
-      if (room.approvedReceivers.has(socketId)) {
-        room.approvedReceivers.delete(socketId);
-        io.to(room.senderSocketId).emit('receiver_left', socketId);
-        console.log(`Receiver ${socketId} left room ${roomId}`);
-      }
-      if (room.pendingRequests.has(socketId)) {
-        room.pendingRequests.delete(socketId);
-      }
+    } else if (room.receiverSocketId === socketId) {
+      room.receiverSocketId = null;
+      room.status = 'waiting';
+      io.to(room.senderSocketId).emit('peer_disconnected');
     }
   }
 });
 
+// ── SPA fallback ───────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (req.method !== 'GET') return next();
   res.sendFile(path.join(publicPath, 'index.html'), (err) => {
-    if (err) res.status(500).send('Static files not built yet.');
+    if (err) res.status(500).send('Static files not built yet. Run: npm run build');
   });
 });
 
+// ── Start server ───────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+httpServer.listen(Number(PORT), '0.0.0.0', () => {
+  console.log(`[SERVER] ChikkoShare v3 listening on port ${PORT}`);
+  console.log(`[SERVER] Cloud mode: ${isCloudEnabled ? 'ENABLED' : 'DISABLED (WebRTC only)'}`);
+  startCleanupWorker();
+});

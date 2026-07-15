@@ -1,110 +1,95 @@
 import { io, Socket } from 'socket.io-client';
-import type { ClientToServerEvents, ServerToClientEvents, RoomData, SignalingMessage, PendingRequest, DeviceInfo } from '../../../shared/types';
+import type { ClientToServerEvents, ServerToClientEvents, SignalingMessage } from '../../../shared/types';
 import { useRoomStore } from '../store/roomStore';
 import { useTransferStore } from '../store/transferStore';
 import toast from 'react-hot-toast';
-import { handleSignalingMessage, closeWebRTC, initiateWebRTCConnection, removePeer } from './webrtc';
+import {
+  handleSignalingMessage,
+  closeWebRTC,
+  initiateSenderConnection,
+} from './webrtc';
+import { downloadFileFromCloud } from './cloudTransfer';
 
-const SOCKET_URL = import.meta.env.PROD ? '/' : 'http://localhost:5000';
+const SOCKET_URL = import.meta.env.PROD ? '/' : 'http://127.0.0.1:5000';
 
 export const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io(SOCKET_URL, {
   autoConnect: false,
 });
 
-export const connectSocket = () => {
-  if (!socket.connected) socket.connect();
-};
+export const connectSocket    = () => { if (!socket.connected) socket.connect(); };
+export const disconnectSocket = () => { if (socket.connected) socket.disconnect(); };
 
-export const disconnectSocket = () => {
-  if (socket.connected) socket.disconnect();
-};
-
+// ── Connection lifecycle ───────────────────────────────────────────────────────
 socket.on('connect', () => {
-  useRoomStore.getState().setSignalingConnection(true);
+  useRoomStore.getState().setSignalingConnected(true);
 });
 
 socket.on('disconnect', () => {
-  useRoomStore.getState().setSignalingConnection(false);
+  useRoomStore.getState().setSignalingConnected(false);
 });
 
-socket.on('room_created', (data: RoomData) => {
-  useRoomStore.getState().setRoomData(data);
-  toast.success('Room created successfully');
+// ── Room events ───────────────────────────────────────────────────────────────
+// SENDER: Receiver joined — start WebRTC immediately
+socket.on('room_joined', ({ receiverSocketId }) => {
+  useRoomStore.getState().setPeerConnected(true);
+  toast.success('Receiver connected!');
+  initiateSenderConnection(receiverSocketId);
 });
 
-socket.on('room_error', (message: string) => {
-  toast.error(message);
+// Either peer: other side disconnected
+socket.on('peer_disconnected', () => {
+  useRoomStore.getState().setPeerConnected(false);
+  toast.error('Peer disconnected.', { duration: 4000 });
+});
+
+socket.on('room_error', (msg) => {
+  toast.error(msg);
   useRoomStore.getState().reset();
   useTransferStore.getState().reset();
   closeWebRTC();
 });
 
-socket.on('room_full', () => {
-  toast.error('The room is full. Cannot join.');
-  useRoomStore.getState().setWaitingForApproval(false);
-});
-
-// SENDER: A new receiver wants to join
-socket.on('join_request', (req: PendingRequest) => {
-  useRoomStore.getState().addPendingRequest(req);
-  toast(`New request from ${req.deviceInfo.name}`, { icon: '👋' });
-});
-
-// SENDER: The receiver was approved and joined the socket room, establish WebRTC now
-socket.on('receiver_joined', (data: { socketId: string, deviceInfo: DeviceInfo }) => {
-  useRoomStore.getState().addConnectedReceiver(data.socketId, data.deviceInfo);
-  toast.success(`${data.deviceInfo.name} connected!`);
-  // Initiate WebRTC connection immediately (Queue or Broadcast, doesn't matter)
-  initiateWebRTCConnection(data.socketId);
-});
-
-// RECEIVER: Sender approved the join request
-socket.on('join_approved', () => {
-  useRoomStore.getState().setWaitingForApproval(false);
-  toast.success('Join request approved!');
-});
-
-// RECEIVER: Sender rejected the join request
-socket.on('join_rejected', (reason: string) => {
-  useRoomStore.getState().setWaitingForApproval(false);
-  useRoomStore.getState().setApprovalRejected(reason);
-  toast.error(reason);
-});
-
+// ── Signaling relay ────────────────────────────────────────────────────────────
 socket.on('signaling_message', (msg: SignalingMessage) => {
   handleSignalingMessage(msg);
 });
 
-// SENDER: A receiver left
-socket.on('receiver_left', (socketId: string) => {
-  const deviceInfo = useRoomStore.getState().connectedReceivers.get(socketId);
-  if (deviceInfo) {
-    toast.error(`${deviceInfo.name} disconnected`);
+// ── Network mode ───────────────────────────────────────────────────────────────
+socket.on('network_mode_set', (mode) => {
+  useRoomStore.getState().setNetworkMode(mode);
+  useTransferStore.getState().setNetworkMode(mode);
+});
+
+// ── Cloud download ready (receiver side) ──────────────────────────────────────
+socket.on('cloud_download_ready', async (data) => {
+  useTransferStore.getState().setOverallStatus('transferring');
+
+  try {
+    await downloadFileFromCloud(
+      data.downloadToken,
+      data.filename,
+      data.size,
+      data.fileIndex,
+      data.checksum
+    );
+
+    const roomId = useRoomStore.getState().roomId;
+    if (roomId) {
+      socket.emit('integrity_check_result', {
+        roomId,
+        fileIndex:        data.fileIndex,
+        passed:           true,
+        receivedChecksum: data.checksum,
+        expectedChecksum: data.checksum,
+      });
+    }
+
+    // If all files done
+    if (data.fileIndex === data.totalFiles - 1) {
+      useTransferStore.getState().setOverallStatus('completed');
+    }
+  } catch (err: any) {
+    toast.error(err.message || 'Download failed.');
+    useTransferStore.getState().setOverallStatus('failed');
   }
-  useRoomStore.getState().removeConnectedReceiver(socketId);
-  removePeer(socketId);
-});
-
-// RECEIVER: Sender left completely
-socket.on('sender_left', () => {
-  toast.error('Sender disconnected completely. Room closed.');
-  closeWebRTC();
-  useRoomStore.getState().reset();
-  useTransferStore.getState().reset();
-});
-
-// RECEIVER: Sender temporarily disconnected
-socket.on('sender_disconnected', () => {
-  useRoomStore.getState().setSenderDisconnected(true);
-  toast.error('Sender disconnected. Waiting for reconnection...', { duration: 5000 });
-});
-
-// RECEIVER: Sender reconnected
-socket.on('sender_reconnected', () => {
-  useRoomStore.getState().setSenderDisconnected(false);
-  toast.success('Sender reconnected! Resuming...');
-  
-  // Send the sync_offset message to the sender so they can resume
-  // Wait, WebRTC connections were probably broken. We should expect a new offer from the sender!
-  // The sender will initiateWebRTCConnection when they reclaim.
 });
