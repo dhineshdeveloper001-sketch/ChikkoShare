@@ -59,7 +59,6 @@ export const initiateSenderConnection = async (receiverSocketId: string): Promis
 
   // Start network detection on this peer connection BEFORE any ICE happens
   detectNetworkMode(peerConnection).then((mode) => {
-    console.log('[WEBRTC] detectNetworkMode resolved:', mode);
     useRoomStore.getState().setNetworkMode(mode);
     useTransferStore.getState().setNetworkMode(mode);
     socket.emit('report_network_mode', { roomId, mode });
@@ -80,16 +79,21 @@ export const initiateSenderConnection = async (receiverSocketId: string): Promis
     }
   };
 
+  let fallbackTriggered = false;
+  const triggerCloudFallback = () => {
+    if (fallbackTriggered || _isCancelled) return;
+    fallbackTriggered = true;
+    if (useRoomStore.getState().networkMode !== 'cloud') {
+      useRoomStore.getState().setNetworkMode('cloud');
+      useTransferStore.getState().setNetworkMode('cloud');
+      socket.emit('report_network_mode', { roomId, mode: 'cloud' });
+      startCloudUpload();
+    }
+  };
+
   peerConnection.onconnectionstatechange = () => {
-    console.log('[WEBRTC] Connection state:', peerConnection?.connectionState);
     if (peerConnection?.connectionState === 'failed') {
-      console.warn('[WEBRTC] Connection failed! Falling back to cloud.');
-      if (useRoomStore.getState().networkMode !== 'cloud') {
-        useRoomStore.getState().setNetworkMode('cloud');
-        useTransferStore.getState().setNetworkMode('cloud');
-        socket.emit('report_network_mode', { roomId, mode: 'cloud' });
-        startCloudUpload();
-      }
+      triggerCloudFallback();
     }
   };
 
@@ -97,13 +101,27 @@ export const initiateSenderConnection = async (receiverSocketId: string): Promis
   dataChannel = peerConnection.createDataChannel('chikko', { ordered: true });
   dataChannel.binaryType = 'arraybuffer';
 
+  let isDcOpened = false;
   dataChannel.onopen = () => {
-    console.log('[WEBRTC] DataChannel onopen fired!');
+    isDcOpened = true;
     useRoomStore.getState().setNetworkMode('local');
     useTransferStore.getState().setNetworkMode('local');
     socket.emit('report_network_mode', { roomId, mode: 'local' });
+
+    dataChannel!.send(JSON.stringify({
+      type: 'init_batch',
+      files: useTransferStore.getState().files
+    }));
+
     startWebRTCTransfer();
   };
+
+  // Hard fallback if DataChannel doesn't open within 7 seconds
+  setTimeout(() => {
+    if (!isDcOpened && !_isCancelled) {
+      triggerCloudFallback();
+    }
+  }, 7000);
 
   dataChannel.onerror = (e) => {
     if (import.meta.env.DEV) console.error('[WEBRTC] DC error:', e);
@@ -185,7 +203,7 @@ export const handleSignalingMessage = async (msg: any): Promise<void> => {
 // SENDER: WebRTC file pump (multi-file)
 // ─────────────────────────────────────────────────────────────────────────────
 async function startWebRTCTransfer(): Promise<void> {
-  const rawFiles: File[] = (window as any).__chikkoFiles ?? [];
+  const rawFiles: File[] = useTransferStore.getState().rawFiles;
   const fileEntries = useTransferStore.getState().files;
   if (rawFiles.length === 0) return;
 
@@ -210,14 +228,19 @@ async function startWebRTCTransfer(): Promise<void> {
 // SENDER: Cloud upload (multi-file, sequential)
 // ─────────────────────────────────────────────────────────────────────────────
 async function startCloudUpload(): Promise<void> {
-  console.log('[CLOUD] startCloudUpload called');
-  const rawFiles: File[] = (window as any).__chikkoFiles ?? [];
+  const rawFiles: File[] = useTransferStore.getState().rawFiles;
   const fileEntries = useTransferStore.getState().files;
   const roomId = useRoomStore.getState().roomId;
   if (!roomId || rawFiles.length === 0) {
-    console.warn('[CLOUD] Aborting startCloudUpload: missing roomId or files', {roomId, count: rawFiles.length});
     return;
   }
+
+  // Notify receiver that cloud upload has started so they can update UI
+  socket.emit('cloud_upload_started', {
+    roomId,
+    files: fileEntries,
+    totalBytes: useTransferStore.getState().totalBytes
+  });
 
   useTransferStore.getState().setOverallStatus('transferring');
 
@@ -227,18 +250,14 @@ async function startCloudUpload(): Promise<void> {
     const entry = fileEntries[i];
     if (!file || !entry) continue;
 
-    useTransferStore.getState().setFileStatus(i, 'preparing');
+    useTransferStore.getState().setFileStatus(i, 'waiting');
 
-    console.log(`[CLOUD] Computing checksum for file ${i}...`);
     // Compute SHA-256 before upload so receiver can verify integrity
     const checksum = await computeFileChecksum(file);
-    console.log(`[CLOUD] Checksum computed: ${checksum}`);
 
     try {
       useTransferStore.getState().setFileStatus(i, 'transferring');
-      console.log(`[CLOUD] Uploading file ${i}...`);
       await uploadFileToCloud(file, entry, i, rawFiles.length, roomId, checksum);
-      console.log(`[CLOUD] Upload complete for file ${i}`);
     } catch (err) {
       if (_isCancelled) break;
       useTransferStore.getState().setFileStatus(i, 'failed');
@@ -466,7 +485,10 @@ const handleIncomingData = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data);
 
-      if (data.type === 'metadata') {
+      if (data.type === 'init_batch') {
+        useTransferStore.getState().setFiles(data.files);
+        useTransferStore.getState().setOverallStatus('transferring');
+      } else if (data.type === 'metadata') {
         // New file incoming
         if (!rxState.hashWorker) {
           rxState.hashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
@@ -486,6 +508,14 @@ const handleIncomingData = (event: MessageEvent) => {
         dataChannel?.send(JSON.stringify({ type: 'sync_offset', offset: rxState.received }));
 
       } else if (data.type === 'eof') {
+        // Flush any remaining progress before EOF
+        if (rxState.bytesAccum > 0) {
+          const elapsed = (performance.now() - rxState.rxStart) / 1000;
+          const speed   = elapsed > 0 ? rxState.received / elapsed : 0;
+          useTransferStore.getState().updateFileProgress(data.fileIndex, rxState.bytesAccum, speed);
+          rxState.bytesAccum = 0;
+        }
+
         // Verify integrity
         rxState.hashWorker!.onmessage = (e) => {
           if (e.data.type !== 'result') return;

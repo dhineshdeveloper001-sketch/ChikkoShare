@@ -1,15 +1,15 @@
 import { Router } from 'express';
-import { handleUpload } from '../controllers/upload.controller';
-import { handleDownload } from '../controllers/download.controller';
-import { uploadRateLimiter } from '../middleware/rateLimit';
+import { initUpload, getPartUrls, completeUpload, getDownloadUrl } from '../controllers/cloud.controller';
+import { uploadInitLimiter, signedUrlLimiter, downloadUrlLimiter } from '../middleware/rateLimit';
+import { requireRoomToken } from '../middleware/auth';
+import { validate, initUploadSchema, getPartUrlsSchema, completeUploadSchema, downloadSchema } from '../middleware/validate';
 
 const router = Router();
 
-// Upload: POST /api/upload
-// Raw body streamed directly to B2 (no multer disk storage)
-router.post('/upload', uploadRateLimiter, handleUpload);
-
-// Download: GET /api/download/:token
-router.get('/download/:token', handleDownload);
+// Cloud endpoints
+router.post('/cloud/init', uploadInitLimiter, validate(initUploadSchema), requireRoomToken, initUpload);
+router.post('/cloud/urls', signedUrlLimiter, validate(getPartUrlsSchema), requireRoomToken, getPartUrls);
+router.post('/cloud/complete', signedUrlLimiter, validate(completeUploadSchema), requireRoomToken, completeUpload);
+router.get('/cloud/download/:token', downloadUrlLimiter, validate(downloadSchema), getDownloadUrl);
 
 export default router;

@@ -35,4 +35,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_transfers_expires ON transfers(expires_at);
 `);
 
+// ── Simple Migrations ──────────────────────────────────────────────────────────
+try { db.exec("ALTER TABLE transfers ADD COLUMN upload_id TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE transfers ADD COLUMN checksum TEXT"); } catch (e) {}
+
 console.log('[DB] SQLite ready at', DB_PATH);

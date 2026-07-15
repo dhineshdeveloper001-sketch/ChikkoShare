@@ -1,12 +1,34 @@
 import { socket } from './socket';
 import { useTransferStore } from '../store/transferStore';
-import toast from 'react-hot-toast';
+import { useRoomStore } from '../store/roomStore';
 import type { FileEntry } from '../../../shared/types';
 
-const UPLOAD_URL   = '/api/upload';
-const DOWNLOAD_URL = (token: string) => `/api/download/${token}`;
+const API_INIT     = '/api/cloud/init';
+const API_URLS     = '/api/cloud/urls';
+const API_COMPLETE = '/api/cloud/complete';
+const API_DOWNLOAD = (token: string) => `/api/cloud/download/${token}`;
 
-// ── Upload a file to Backblaze B2 via the backend API ─────────────────────────
+function getAdaptiveChunkSize(fileSize: number): number {
+  const MB = 1024 * 1024;
+  if (fileSize < 100 * MB) return 8 * MB;
+  if (fileSize < 2000 * MB) return 16 * MB;
+  if (fileSize < 10000 * MB) return 32 * MB;
+  return 64 * MB;
+}
+
+function getAdaptiveConcurrency(speedBps: number): number {
+  const MB = 1024 * 1024;
+  if (speedBps === 0) return 4; // default start
+  if (speedBps < 1 * MB) return 2; // slow
+  if (speedBps < 5 * MB) return 4; // medium
+  return 6; // fast
+}
+
+export const cancelCloudUpload = () => {
+  // Cancel logic can be hooked up if needed by aborting XHRs
+};
+
+// ── Upload a file to Backblaze B2 via Signed URLs ──────────────────────────────
 export async function uploadFileToCloud(
   file: File,
   fileEntry: FileEntry,
@@ -15,59 +37,154 @@ export async function uploadFileToCloud(
   roomId: string,
   checksum: string
 ): Promise<void> {
+  const token = useRoomStore.getState().token;
+  const initRes = await fetch(API_INIT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomId, token, filename: fileEntry.relativePath || fileEntry.name, size: file.size })
+  }).then(r => r.json());
+
+  if (!initRes.success) throw new Error(initRes.message);
+
+  const { uploadId, bucketKey, transferId, downloadToken } = initRes;
+
+  const chunkSize = getAdaptiveChunkSize(file.size);
+  const totalParts = Math.ceil(file.size / chunkSize);
+  const parts: { PartNumber: number, ETag: string }[] = [];
+
+  let currentPart = 1;
+  let bytesUploaded = 0;
+  let activeUploads = 0;
+  let speedBps = 0;
+  const urlCache = new Map<number, { url: string, expiresAt: number }>();
+
+  useTransferStore.getState().setFileStatus(fileIndex, 'transferring');
+
+  const fetchUrls = async (startPart: number, count: number) => {
+    const partNumbers = [];
+    for (let i = 0; i < count; i++) {
+      const pn = startPart + i;
+      if (pn <= totalParts && !urlCache.has(pn)) partNumbers.push(pn);
+    }
+    if (partNumbers.length === 0) return;
+    
+    const res = await fetch(API_URLS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId, token, bucketKey, uploadId, partNumbers })
+    }).then(r => r.json());
+    
+    if (res.success) {
+      const now = Date.now();
+      res.urls.forEach((u: any) => {
+        urlCache.set(u.partNumber, { url: u.url, expiresAt: now + 14 * 60 * 1000 }); // 14 mins valid locally
+      });
+    }
+  };
+
+  // Prefetch first batch
+  await fetchUrls(1, 10);
+
+  let lastTime = performance.now();
+  let lastBytes = 0;
+
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', UPLOAD_URL, true);
-    xhr.setRequestHeader('x-room-id',   roomId);
-    xhr.setRequestHeader('x-filename',  fileEntry.relativePath || fileEntry.name);
-    xhr.setRequestHeader('x-file-size', String(fileEntry.size));
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-
-    let lastLoaded = 0;
-    let lastTime   = performance.now();
-
-    xhr.upload.onprogress = (e) => {
-      if (!e.lengthComputable) return;
-      const now        = performance.now();
-      const deltaBytes = e.loaded - lastLoaded;
-      const deltaSec   = (now - lastTime) / 1000;
-      const speedBps   = deltaSec > 0 ? deltaBytes / deltaSec : 0;
-      lastLoaded       = e.loaded;
-      lastTime         = now;
-      useTransferStore.getState().updateFileProgress(fileIndex, deltaBytes, speedBps);
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const res = JSON.parse(xhr.responseText) as {
-          downloadToken: string;
-          expiresAt: number;
-        };
-
-        // Notify server — it will relay cloud_download_ready to the receiver
-        socket.emit('cloud_upload_complete', {
-          roomId,
-          downloadToken: res.downloadToken,
-          expiresAt:     res.expiresAt,
-          fileIndex,
-          totalFiles,
-          filename:      fileEntry.name,
-          size:          fileEntry.size,
-          checksum,
-        });
-
-        useTransferStore.getState().setFileStatus(fileIndex, 'completed');
-        resolve();
-      } else {
-        reject(new Error(`Upload failed: ${xhr.responseText}`));
+    const uploadNextPart = async () => {
+      // Check pause/cancel state
+      const state = useTransferStore.getState();
+      if (state.overallStatus === 'cancelled') {
+        reject(new Error('Upload cancelled'));
+        return;
       }
+
+      if (currentPart > totalParts) {
+        if (activeUploads === 0 && parts.length === totalParts) {
+          // Finish
+          try {
+            const compRes = await fetch(API_COMPLETE, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ roomId, token, transferId, bucketKey, uploadId, parts, checksum })
+            }).then(r => r.json());
+
+            if (compRes.success) {
+              socket.emit('cloud_upload_complete', {
+                roomId, downloadToken, expiresAt: Date.now() + 600000,
+                fileIndex, totalFiles, filename: fileEntry.name, size: file.size, checksum
+              });
+              useTransferStore.getState().setFileStatus(fileIndex, 'completed');
+              resolve();
+            } else {
+              reject(new Error(compRes.message));
+            }
+          } catch (e: any) { reject(e); }
+        }
+        return;
+      }
+
+      const partNum = currentPart++;
+      activeUploads++;
+
+      // Ensure URL is prefetched and valid
+      if (!urlCache.has(partNum) || Date.now() > urlCache.get(partNum)!.expiresAt) {
+        await fetchUrls(partNum, 10);
+      }
+
+      const urlData = urlCache.get(partNum);
+      if (!urlData) {
+        reject(new Error(`Failed to get presigned URL for part ${partNum}`));
+        return;
+      }
+
+      const start = (partNum - 1) * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      const chunk = file.slice(start, end);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', urlData.url, true);
+      
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const now = performance.now();
+          const totalUploadedNow = bytesUploaded + e.loaded;
+          if (now - lastTime > 250) {
+            const deltaBytes = totalUploadedNow - lastBytes;
+            const deltaSec = (now - lastTime) / 1000;
+            speedBps = deltaBytes / deltaSec;
+            lastTime = now;
+            lastBytes = totalUploadedNow;
+            useTransferStore.getState().updateFileProgress(fileIndex, deltaBytes, speedBps);
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        activeUploads--;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const etag = xhr.getResponseHeader('ETag') || '';
+          parts.push({ PartNumber: partNum, ETag: etag });
+          bytesUploaded += chunk.size;
+          
+          // Adjust concurrency based on speed
+          const targetConcurrency = getAdaptiveConcurrency(speedBps);
+          while (activeUploads < targetConcurrency && currentPart <= totalParts) {
+            uploadNextPart();
+          }
+        } else {
+          reject(new Error(`Upload part ${partNum} failed: ${xhr.statusText}`));
+        }
+      };
+
+      xhr.onerror = () => { activeUploads--; reject(new Error('Network error')); };
+      xhr.onabort = () => { activeUploads--; reject(new Error('Aborted')); };
+      xhr.send(chunk);
     };
 
-    xhr.onerror = () => reject(new Error('Network error during upload.'));
-    xhr.onabort = () => reject(new Error('Upload cancelled.'));
-
-    xhr.send(file);
-    (window as any).__chikkoXhr = xhr;
+    // Start initial concurrent uploads
+    const initialConcurrency = getAdaptiveConcurrency(0);
+    for (let i = 0; i < Math.min(initialConcurrency, totalParts); i++) {
+      uploadNextPart();
+    }
   });
 }
 
@@ -75,95 +192,68 @@ export async function uploadFileToCloud(
 export async function downloadFileFromCloud(
   downloadToken: string,
   filename: string,
-  _fileSize: number,   // kept for API compat, size comes from server response
-  fileIndex: number,
-  expectedChecksum: string
+  _fileSize: number,
+  fileIndex: number
 ): Promise<void> {
   useTransferStore.getState().setFileStatus(fileIndex, 'transferring');
 
-  // Step 1: Get signed URL + metadata from our backend
-  const metaRes = await fetch(DOWNLOAD_URL(downloadToken));
+  const metaRes = await fetch(API_DOWNLOAD(downloadToken));
   if (!metaRes.ok) {
-    const err = await metaRes.json().catch(() => ({ error: 'Failed to get download URL' }));
-    throw new Error((err as { error: string }).error || 'Failed to get download URL');
+    const err = await metaRes.json().catch(() => ({ message: 'Failed to get download URL' }));
+    throw new Error(err.message);
   }
-  const { url, size } = (await metaRes.json()) as { url: string; size: number; filename: string };
+  const { url, size } = await metaRes.json();
 
-  // Step 2: Resume support — check how many bytes we already have
   const resumeKey   = `chikko_resume_${downloadToken}`;
   const resumeBytes = parseInt(sessionStorage.getItem(resumeKey) ?? '0', 10);
 
-  const headers: HeadersInit = {};
-  if (resumeBytes > 0 && resumeBytes < size) {
-    headers['Range'] = `bytes=${resumeBytes}-`;
-  }
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.responseType = 'blob';
 
-  // Step 3: Stream download with hash verification
-  const dlRes = await fetch(url, { headers });
-  if (!dlRes.ok && dlRes.status !== 206) {
-    throw new Error(`Download failed with status ${dlRes.status}`);
-  }
+    if (resumeBytes > 0 && resumeBytes < size) {
+      xhr.setRequestHeader('Range', `bytes=${resumeBytes}-`);
+    }
 
-  const reader  = dlRes.body!.getReader();
-  const buffers: ArrayBuffer[] = [];
-  let   received = resumeBytes;
-  let   lastTime = performance.now();
-  let   lastBytes = 0;
+    let lastLoaded = resumeBytes;
+    let lastTime   = performance.now();
 
-  const hashWorker = new Worker(new URL('../workers/hashWorker.ts', import.meta.url), { type: 'module' });
-  hashWorker.postMessage({ type: 'init' });
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    const ab = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
-    buffers.push(ab);
-    hashWorker.postMessage({ type: 'update', chunk: ab });
-    received += value.byteLength;
-
-    const now      = performance.now();
-    const elapsed  = (now - lastTime) / 1000;
-    const speedBps = elapsed > 0 ? (received - lastBytes) / elapsed : 0;
-    useTransferStore.getState().updateFileProgress(fileIndex, value.byteLength, speedBps);
-    sessionStorage.setItem(resumeKey, String(received));
-
-    lastTime  = now;
-    lastBytes = received;
-  }
-
-  // Step 4: Verify SHA-256 before completing
-  useTransferStore.getState().setFileStatus(fileIndex, 'verifying');
-
-  const verifiedHash = await new Promise<string>((resolve) => {
-    hashWorker.onmessage = (e: MessageEvent) => {
-      if (e.data.type === 'result') resolve(e.data.hash as string);
+    xhr.onprogress = (e) => {
+      const now = performance.now();
+      const totalLoaded = resumeBytes + e.loaded;
+      if (now - lastTime > 250) {
+        const deltaBytes = totalLoaded - lastLoaded;
+        const deltaSec   = (now - lastTime) / 1000;
+        const speedBps   = deltaBytes / deltaSec;
+        lastLoaded = totalLoaded;
+        lastTime = now;
+        useTransferStore.getState().updateFileProgress(fileIndex, deltaBytes, speedBps);
+        sessionStorage.setItem(resumeKey, String(totalLoaded));
+      }
     };
-    hashWorker.postMessage({ type: 'finish' });
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const blob = xhr.response;
+        const objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(objectUrl);
+        
+        sessionStorage.removeItem(resumeKey);
+        useTransferStore.getState().setFileStatus(fileIndex, 'completed');
+        resolve();
+      } else {
+        reject(new Error(`Download failed: ${xhr.statusText}`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('Network error during download'));
+    xhr.onabort = () => reject(new Error('Download cancelled'));
+    
+    xhr.send();
   });
-  hashWorker.terminate();
-
-  if (verifiedHash !== expectedChecksum) {
-    useTransferStore.getState().setFileStatus(fileIndex, 'failed');
-    throw new Error(`Integrity check failed for ${filename}. File may be corrupted.`);
-  }
-
-  // Step 5: Trigger browser download
-  const blob   = new Blob(buffers, { type: 'application/octet-stream' });
-  const objUrl = URL.createObjectURL(blob);
-  const a      = document.createElement('a');
-  a.href       = objUrl;
-  a.download   = filename;
-  a.click();
-  URL.revokeObjectURL(objUrl);
-  sessionStorage.removeItem(resumeKey);
-
-  useTransferStore.getState().setFileStatus(fileIndex, 'completed');
-  toast.success(`Downloaded: ${filename}`);
-}
-
-// ── Cancel active cloud upload ─────────────────────────────────────────────────
-export function cancelCloudUpload(): void {
-  const xhr = (window as any).__chikkoXhr as XMLHttpRequest | undefined;
-  xhr?.abort();
 }

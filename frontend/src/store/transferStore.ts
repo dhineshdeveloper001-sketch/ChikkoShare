@@ -17,6 +17,7 @@ interface TransferStoreState {
 
   // Batch of files being transferred
   files: FileEntry[];
+  rawFiles: File[];
   totalBytes: number;
   fileStates: FileTransferState[];
   currentFileIndex: number;
@@ -36,7 +37,7 @@ interface TransferStoreState {
 
   // Actions
   setRole: (role: 'sender' | 'receiver') => void;
-  setFiles: (files: FileEntry[]) => void;
+  setFiles: (files: FileEntry[], rawFiles?: File[]) => void;
   setNetworkMode: (mode: NetworkMode) => void;
   setOverallStatus: (status: TransferStatus) => void;
 
@@ -56,6 +57,7 @@ export const useTransferStore = create<TransferStoreState>()(
     (set) => ({
       role: null,
       files: [],
+      rawFiles: [],
       totalBytes: 0,
       fileStates: [],
       currentFileIndex: 0,
@@ -69,7 +71,7 @@ export const useTransferStore = create<TransferStoreState>()(
 
       setRole: (role) => set({ role }),
 
-      setFiles: (files) => {
+      setFiles: (files, rawFiles = []) => {
         const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
         const fileStates: FileTransferState[] = files.map((f) => ({
           file: f,
@@ -79,8 +81,17 @@ export const useTransferStore = create<TransferStoreState>()(
           etaSeconds: 0,
           progress: 0,
         }));
-        // Store raw File objects on window for webrtc.ts to access
-        set({ files, totalBytes, fileStates, currentFileIndex: 0, totalBytesTransferred: 0 });
+        set({
+          files,
+          rawFiles,
+          totalBytes,
+          fileStates,
+          currentFileIndex: 0,
+          overallStatus: 'idle',
+          totalBytesTransferred: 0,
+          overallSpeedBps: 0,
+          overallEtaSeconds: 0,
+        });
       },
 
       setNetworkMode: (networkMode) => set({ networkMode }),
@@ -142,6 +153,7 @@ export const useTransferStore = create<TransferStoreState>()(
         set({
           role: null,
           files: [],
+          rawFiles: [],
           totalBytes: 0,
           fileStates: [],
           currentFileIndex: 0,

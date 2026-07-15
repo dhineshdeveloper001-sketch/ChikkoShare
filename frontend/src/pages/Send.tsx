@@ -127,9 +127,8 @@ const Send: React.FC = () => {
     if (fileObjs.length === 0) return;
 
     useTransferStore.getState().reset();
-    (window as any).__chikkoFiles = fileObjs;
     useTransferStore.getState().setRole('sender');
-    useTransferStore.getState().setFiles(entryObjs);
+    useTransferStore.getState().setFiles(entryObjs, fileObjs);
 
     useRoomStore.getState().reset();
     closeWebRTC();

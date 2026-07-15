@@ -56,7 +56,7 @@ const Receive: React.FC = () => {
 
   // Track transfer status changes
   useEffect(() => {
-    if (overallStatus === 'transferring') setState('transferring');
+    if (overallStatus === 'waiting' || overallStatus === 'transferring') setState('transferring');
     if (overallStatus === 'completed')    setState('done');
     if (overallStatus === 'failed')       setState('failed');
   }, [overallStatus]);
@@ -324,7 +324,9 @@ const Receive: React.FC = () => {
               <div className="flex items-center justify-between mb-6">
                 <div>
                   <p className="font-semibold text-white">
-                    {files[currentFileIndex]?.name ?? 'Receiving...'}
+                    {overallStatus === 'waiting' 
+                      ? 'Sender is uploading to cloud...' 
+                      : (files[currentFileIndex]?.name ?? 'Receiving...')}
                   </p>
                   {files.length > 1 && (
                     <p className="text-slate-500 text-xs">File {currentFileIndex + 1} of {files.length}</p>

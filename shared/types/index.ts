@@ -27,6 +27,13 @@ export interface CloudDownloadData {
   checksum: string;     // SHA-256 hex — receiver verifies after download
 }
 
+// ── Cloud upload started (sent from sender to receiver) ───────────────────────
+export interface CloudUploadStartedData {
+  roomId: string;
+  files: FileEntry[];
+  totalBytes: number;
+}
+
 // ── Integrity check ───────────────────────────────────────────────────────────
 export interface IntegrityCheckResult {
   roomId: string;
@@ -61,6 +68,9 @@ export interface ServerToClientEvents {
   // Cloud path: server tells receiver a file is ready to download
   cloud_download_ready: (data: CloudDownloadData) => void;
 
+  // Cloud path: sender tells receiver that upload has started
+  cloud_upload_started: (data: Omit<CloudUploadStartedData, 'roomId'>) => void;
+
   // Integrity check relay
   integrity_check_result: (data: IntegrityCheckResult) => void;
 }
@@ -93,6 +103,9 @@ export interface ClientToServerEvents {
     checksum: string;
   }) => void;
 
+  // Sender: B2 upload started (relay metadata to receiver)
+  cloud_upload_started: (data: CloudUploadStartedData) => void;
+
   // Receiver: reports integrity check result back to sender
   integrity_check_result: (data: IntegrityCheckResult) => void;
 
@@ -115,11 +128,14 @@ export interface TransferRecord {
 // ── Transfer status ───────────────────────────────────────────────────────────
 export type TransferStatus =
   | 'idle'
-  | 'preparing'
+  | 'room_created'
+  | 'waiting'
   | 'connecting'
+  | 'connected'
   | 'transferring'
   | 'paused'
   | 'verifying'
   | 'completed'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  | 'cleanup';

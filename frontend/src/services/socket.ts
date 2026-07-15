@@ -9,9 +9,7 @@ import {
   initiateSenderConnection,
 } from './webrtc';
 import { downloadFileFromCloud } from './cloudTransfer';
-
-const SOCKET_URL = import.meta.env.PROD ? '/' : 'http://127.0.0.1:5000';
-
+const SOCKET_URL = import.meta.env.PROD ? '/' : `http://${window.location.hostname}:5000`;
 export const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io(SOCKET_URL, {
   autoConnect: false,
 });
@@ -60,6 +58,12 @@ socket.on('network_mode_set', (mode) => {
   useTransferStore.getState().setNetworkMode(mode);
 });
 
+// ── Cloud path (receiver side) ────────────────────────────────────────────────
+socket.on('cloud_upload_started', (data) => {
+  useTransferStore.getState().setFiles(data.files);
+  useTransferStore.getState().setOverallStatus('waiting');
+});
+
 // ── Cloud download ready (receiver side) ──────────────────────────────────────
 socket.on('cloud_download_ready', async (data) => {
   useTransferStore.getState().setOverallStatus('transferring');
@@ -69,8 +73,7 @@ socket.on('cloud_download_ready', async (data) => {
       data.downloadToken,
       data.filename,
       data.size,
-      data.fileIndex,
-      data.checksum
+      data.fileIndex
     );
 
     const roomId = useRoomStore.getState().roomId;

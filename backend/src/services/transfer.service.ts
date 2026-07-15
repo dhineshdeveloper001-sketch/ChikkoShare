@@ -12,6 +12,8 @@ export interface TransferRecord {
   expires_at: number;
   download_token: string;
   network_mode: string;
+  upload_id: string | null;
+  checksum: string | null;
   created_at: number;
   downloaded_at: number | null;
 }
@@ -22,6 +24,8 @@ export interface CreateTransferInput {
   size: number;
   bucketKey: string;
   networkMode?: string;
+  uploadId?: string;
+  checksum?: string;
 }
 
 // ── Create a pending transfer record ──────────────────────────────────────────
@@ -32,9 +36,9 @@ export function createTransfer(input: CreateTransferInput): TransferRecord {
   const expiresAt     = now + TRANSFER_CONFIG.deleteAbandonedAfterMs;
 
   db.prepare(`
-    INSERT INTO transfers (id, room_id, filename, size, bucket_key, status, expires_at, download_token, network_mode, created_at)
-    VALUES (?, ?, ?, ?, ?, 'uploading', ?, ?, ?, ?)
-  `).run(id, input.roomId, input.filename, input.size, input.bucketKey, expiresAt, downloadToken, input.networkMode ?? 'cloud', now);
+    INSERT INTO transfers (id, room_id, filename, size, bucket_key, status, expires_at, download_token, network_mode, upload_id, checksum, created_at)
+    VALUES (?, ?, ?, ?, ?, 'uploading', ?, ?, ?, ?, ?, ?)
+  `).run(id, input.roomId, input.filename, input.size, input.bucketKey, expiresAt, downloadToken, input.networkMode ?? 'cloud', input.uploadId ?? null, input.checksum ?? null, now);
 
   return getByToken(downloadToken)!;
 }

@@ -30,7 +30,5 @@ export const TRANSFER_CONFIG = {
   downloadUrlExpirySeconds: parseInt(process.env.DOWNLOAD_URL_EXPIRY_SECONDS ?? '900',      10),
   deleteAfterDownloadMs:    parseInt(process.env.DELETE_AFTER_DOWNLOAD_MS    ?? '600000',   10),
   deleteAbandonedAfterMs:   parseInt(process.env.DELETE_ABANDONED_AFTER_MS  ?? '86400000', 10),
-  maxFileSizeBytes:         50 * 1024 * 1024 * 1024, // 50 GB
-  partSizeBytes:            10 * 1024 * 1024,         // 10 MB multipart chunks
-  maxConcurrentParts:       4,
+  maxFileSizeBytes:         parseInt(process.env.MAX_FILE_SIZE               ?? '53687091200', 10), // 50 GB
 };

@@ -1,26 +1,22 @@
 import cron from 'node-cron';
-import { cleanupExpiredTransfers } from '../services/cleanup.service';
+import { cleanupExpiredTransfers as processCleanup } from '../services/cleanup.service';
 
 export function startCleanupWorker(): void {
-  // Run every hour at minute 0
+  // Scheduled runs
   cron.schedule('0 * * * *', async () => {
-    console.log('[CLEANUP WORKER] Running scheduled cleanup...');
     try {
-      await cleanupExpiredTransfers();
+      await processCleanup();
     } catch (err) {
-      console.error('[CLEANUP WORKER] Error during cleanup:', err);
+      console.error('[CLEANUP WORKER] Scheduled error:', err);
     }
   });
 
-  // Also run once on startup to clean up any leftovers from previous runs
+  // Startup run (wait 10s to let server breathe)
   setTimeout(async () => {
-    console.log('[CLEANUP WORKER] Running startup cleanup...');
     try {
-      await cleanupExpiredTransfers();
+      await processCleanup();
     } catch (err) {
-      console.error('[CLEANUP WORKER] Startup cleanup error:', err);
+      console.error('[CLEANUP WORKER] Startup error:', err);
     }
-  }, 5000);
-
-  console.log('[CLEANUP WORKER] Scheduled — runs every hour.');
+  }, 10000);
 }

@@ -28,7 +28,8 @@
     "multer": "^2.2.0",
     "node-cron": "^4.6.0",
     "socket.io": "^4.8.3",
-    "uuid": "^14.0.1"
+    "uuid": "^14.0.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
