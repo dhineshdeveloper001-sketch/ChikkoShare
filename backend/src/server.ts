@@ -49,17 +49,9 @@ app.use(helmet({
   xFrameOptions: { action: "deny" }
 }));
 
-const allowedOrigins = process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : ['http://localhost:3000'];
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  optionsSuccessStatus: 200
-}));
+const rawFrontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+const frontendUrl = rawFrontendUrl.endsWith('/') ? rawFrontendUrl.slice(0, -1) : rawFrontendUrl;
+const allowedOrigins = [frontendUrl];
 
 app.use(compression());
 app.use(express.json());
@@ -70,6 +62,22 @@ if (!fs.existsSync(publicPath)) publicPath = path.join(__dirname, '../public');
 if (!fs.existsSync(publicPath)) publicPath = path.join(__dirname, '../../../public');
 if (!fs.existsSync(publicPath)) publicPath = path.join(process.cwd(), 'backend/public');
 app.use(express.static(publicPath));
+
+// ── CORS for API & Sockets ───────────────────────────────────────────────────
+const corsOptions = {
+  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  optionsSuccessStatus: 200
+};
+
+app.use('/api', cors(corsOptions));
+
+
 
 // ── API routes ────────────────────────────────────────────────────────────────
 app.use('/api', transferRoutes);
